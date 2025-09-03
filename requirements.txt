@@ -1,1 +1,9 @@
-streamlit==1.36.0 pandas==2.2.2 openpyxl==3.1.2
+streamlit
+pandas
+datetime, timedelta
+unicodedata
+io
+base64
+Workbook
+dataframe_to_rows
+random
