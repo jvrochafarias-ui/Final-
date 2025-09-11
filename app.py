@@ -27,33 +27,52 @@ def normalizar_texto(txt):
 def esta_disponivel(row, data):
     """
     Verifica se a pessoa está disponível na data desejada.
-    Bloqueia qualquer pessoa que tenha INICIO e FIM de indisponibilidade que inclua a data.
+    Bloqueia qualquer pessoa que:
+    1. Tenha INICIO/FIM de indisponibilidade que inclua a data, ou
+    2. Tenha DIAS_INDISPONIBILIDADE dentro desse intervalo.
     """
     if pd.isna(data):
         return True
 
-    data = pd.to_datetime(data).normalize()  # normaliza a data para comparar
+    data = pd.to_datetime(data).normalize()
 
-    inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
-    fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
+    # Converte inicio/fim para datetime, ignora erros
+    inicio = pd.to_datetime(row.get('INICIO_INDISPONIBILIDADE', pd.NaT), errors='coerce')
+    fim = pd.to_datetime(row.get('FIM_INDISPONIBILIDADE', pd.NaT), errors='coerce')
+    dias_indisp = row.get('DIAS_INDISPONIBILIDADE', "")
 
     # Se a pessoa marcou "SIM" na coluna de indisponibilidade geral
     if str(inicio).strip().upper() == 'SIM':
         return False
 
-    # Tenta converter as colunas para datas (se forem strings)
-    try:
-        if pd.notna(inicio):
-            inicio = pd.to_datetime(inicio, dayfirst=True).normalize()
-        if pd.notna(fim):
-            fim = pd.to_datetime(fim, dayfirst=True).normalize()
-    except Exception:
-        return True  # Se não for data válida, ignora
-
-    # Bloqueia qualquer data dentro do intervalo de indisponibilidade
+    # Bloqueio por intervalo de datas
+    bloqueio_por_data = False
     if pd.notna(inicio) and pd.notna(fim):
         if inicio <= data <= fim:
-            return False
+            bloqueio_por_data = True
+
+    # Bloqueio por dia da semana dentro do intervalo
+    bloqueio_por_dia = False
+    if bloqueio_por_data and pd.notna(dias_indisp) and dias_indisp != "":
+        dias_indisp = [d.strip().upper() for d in str(dias_indisp).split(',')]
+        dia_semana = data.strftime('%A').upper()
+        traducao = {
+            'MONDAY':'SEGUNDA',
+            'TUESDAY':'TERCA',
+            'WEDNESDAY':'QUARTA',
+            'THURSDAY':'QUINTA',
+            'FRIDAY':'SEXTA'
+        }
+        dia_semana_pt = traducao.get(dia_semana, dia_semana)
+        if dia_semana_pt in dias_indisp:
+            bloqueio_por_dia = True
+
+    if bloqueio_por_data and bloqueio_por_dia:
+        return False
+    elif bloqueio_por_data and dias_indisp == "":
+        return False
+    elif bloqueio_por_dia:
+        return False
 
     return True
 
@@ -84,6 +103,7 @@ def processar_distribuicao(arquivo_excel):
     df['MUNICIPIO_ORIGEM'] = df.get('MUNICIPIO_ORIGEM', pd.Series("")).fillna("")
     df['INICIO_INDISPONIBILIDADE'] = df.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     df['FIM_INDISPONIBILIDADE'] = df.get('FIM_INDISPONIBILIDADE', pd.NaT)
+    df['DIAS_INDISPONIBILIDADE'] = df.get('DIAS_INDISPONIBILIDADE', pd.Series("")).fillna("")
 
     distribuicoes = []                  
     pessoas_agendadas = {}
@@ -93,7 +113,7 @@ def processar_distribuicao(arquivo_excel):
 
     dias_distribuicao = df[['DIA', 'DATA', 'MUNICIPIO', 'CATEGORIA', 'QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
-                        'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
+                        'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE', 'DIAS_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
     traducao_dias_eng = {'MONDAY':'SEGUNDA','TUESDAY':'TERCA','WEDNESDAY':'QUARTA','THURSDAY':'QUINTA','FRIDAY':'SEXTA'}
 
@@ -113,7 +133,7 @@ def processar_distribuicao(arquivo_excel):
             (candidatos_df['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))) &
             (candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio))
         ].copy()
-        # Aplica indisponibilidade, incluindo o período de datas
+        # Aplica indisponibilidade, incluindo dias e período de datas
         candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
 
         if dia_semana_pt in pessoas_agendadas:
@@ -181,9 +201,10 @@ def processar_distribuicao(arquivo_excel):
             pessoas_agendadas[dia_semana_pt] = []
         pessoas_agendadas[dia_semana_pt].extend(selecionados['NOME'].tolist())
 
-    df_convocados = pd.DataFrame(distribuicoes)
-
+    # ------------------------
     # Lista de não convocados
+    # ------------------------
+    df_convocados = pd.DataFrame(distribuicoes)
     nao_convocados_lista = []
     for _, row in dias_distribuicao.iterrows():
         municipio = row['MUNICIPIO']
@@ -211,7 +232,9 @@ def processar_distribuicao(arquivo_excel):
 
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA"])
 
+    # ------------------------
     # Salva Excel
+    # ------------------------
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
@@ -231,7 +254,7 @@ def processar_distribuicao(arquivo_excel):
     return nome_arquivo_saida, df_convocados, df_nao_convocados, output
 
 # ------------------------
-# Interface Streamlit (layout moderno)
+# Interface Streamlit
 # ------------------------
 st.set_page_config(page_title="Distribuição Aleatória", page_icon="📊", layout="centered")
 
