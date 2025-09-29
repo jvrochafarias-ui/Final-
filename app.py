@@ -53,6 +53,16 @@ def pode_atuar_mesmo_municipio(nome, municipio, data, historico_municipio):
             return False
     return True
 
+def possui_todas_categorias(pessoa_categorias, categorias_necessarias):
+    """
+    Retorna True se a pessoa possui todas as categorias necessárias da operação.
+    """
+    pessoa_cats = [c.strip().upper() for c in str(pessoa_categorias).replace(',', ' ').split()]
+    for cat in categorias_necessarias:
+        if cat.upper().strip() not in pessoa_cats:
+            return False
+    return True
+
 # ------------------------
 # Processamento da distribuição
 # ------------------------
@@ -114,7 +124,7 @@ def processar_distribuicao(arquivo_excel):
             quantidade = int(op['QUANTIDADE'])
 
             candidatos_op = pessoas_disponiveis[
-                pessoas_disponiveis['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
+                pessoas_disponiveis['CATEGORIA'].apply(lambda x: possui_todas_categorias(x, categorias_necessarias))
             ]
             candidatos_op = candidatos_op[candidatos_op['NOME'].apply(lambda n: pode_atuar_mesmo_municipio(n, municipio, data_municipio, historico_municipio))]
 
@@ -160,7 +170,7 @@ def processar_distribuicao(arquivo_excel):
             faltando = quantidade - len(selecionados)
             if faltando > 0:
                 candidatos_faltantes = sobrantes_dia[
-                    sobrantes_dia['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias)) &
+                    sobrantes_dia['CATEGORIA'].apply(lambda x: possui_todas_categorias(x, categorias_necessarias)) &
                     sobrantes_dia['NOME'].apply(lambda n: pode_atuar_mesmo_municipio(n, municipio, data_municipio, historico_municipio))
                 ]
                 if not candidatos_faltantes.empty:
@@ -195,7 +205,7 @@ def processar_distribuicao(arquivo_excel):
         ) if pd.notna(data_municipio) else str(row['DIA']).upper()
 
         candidatos = candidatos_df[
-            (candidatos_df['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))) &
+            (candidatos_df['CATEGORIA'].apply(lambda x: possui_todas_categorias(x, categorias_necessarias))) &
             (candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio))
         ].copy()
         candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
@@ -329,3 +339,5 @@ if arquivo:
                 """,
                 unsafe_allow_html=True
             )
+
+
