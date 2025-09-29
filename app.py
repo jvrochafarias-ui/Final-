@@ -25,36 +25,32 @@ def normalizar_texto(txt):
     return txt
 
 def esta_disponivel(row, data):
-    """
-    Verifica se a pessoa está disponível na data desejada.
-    Bloqueia qualquer pessoa que tenha INICIO e FIM de indisponibilidade que inclua a data.
-    """
     if pd.isna(data):
         return True
-
-    data = pd.to_datetime(data).normalize()  # normaliza a data para comparar
-
+    data = pd.to_datetime(data).normalize()
     inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
-
-    # Se a pessoa marcou "SIM" na coluna de indisponibilidade geral
     if str(inicio).strip().upper() == 'SIM':
         return False
-
-    # Tenta converter as colunas para datas (se forem strings)
     try:
         if pd.notna(inicio):
             inicio = pd.to_datetime(inicio, dayfirst=True).normalize()
         if pd.notna(fim):
             fim = pd.to_datetime(fim, dayfirst=True).normalize()
     except Exception:
-        return True  # Se não for data válida, ignora
-
-    # Bloqueia qualquer data dentro do intervalo de indisponibilidade
+        return True
     if pd.notna(inicio) and pd.notna(fim):
         if inicio <= data <= fim:
             return False
+    return True
 
+def pode_atuar_mesmo_municipio(nome, municipio, data, historico_municipio):
+    """Verifica se a pessoa não atuou no mesmo município na mesma semana."""
+    week_start = data - timedelta(days=data.weekday())
+    week_end = week_start + timedelta(days=6)
+    for mun, data_mun in historico_municipio.get(nome, []):
+        if normalizar_texto(mun) == normalizar_texto(municipio) and week_start <= data_mun <= week_end:
+            return False
     return True
 
 # ------------------------
@@ -65,10 +61,8 @@ def processar_distribuicao(arquivo_excel):
     sheet_name = 'Planilha1' if 'Planilha1' in xls.sheet_names else xls.sheet_names[0]
     df = pd.read_excel(xls, sheet_name=sheet_name)
 
-    # Normalizar colunas
     df.columns = [normalizar_coluna(col) for col in df.columns]
 
-    # Garantir coluna NOME
     colunas_possiveis_nome = ['NOME', 'NOME_COMPLETO', 'NOME_PESSOA']
     for col in colunas_possiveis_nome:
         if col in df.columns:
@@ -78,7 +72,6 @@ def processar_distribuicao(arquivo_excel):
         st.error(f"❌ Erro: não foi possível localizar a coluna de nomes. Colunas disponíveis: {df.columns.tolist()}")
         return None, pd.DataFrame(), pd.DataFrame(), io.BytesIO()
 
-    # Criar colunas padrão
     df['INDISPONIBILIDADE'] = df.get('INDISPONIBILIDADE', pd.Series("NAO")).fillna("NAO")
     df['PRESIDENTE_DE_BANCA'] = df.get('PRESIDENTE_DE_BANCA', pd.Series("NAO")).fillna("NAO")
     df['MUNICIPIO_ORIGEM'] = df.get('MUNICIPIO_ORIGEM', pd.Series("")).fillna("")
@@ -98,41 +91,37 @@ def processar_distribuicao(arquivo_excel):
     traducao_dias_eng = {'MONDAY':'SEGUNDA','TUESDAY':'TERCA','WEDNESDAY':'QUARTA','THURSDAY':'QUINTA','FRIDAY':'SEXTA'}
 
     # ------------------------
-    # Loop de distribuição por dia e município (corrigido)
+    # Loop de distribuição por dia e município com redistribuição avançada
     # ------------------------
     for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA','MUNICIPIO','DATA']):
         data_municipio = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
         dia_semana_pt = traducao_dias_eng.get(pd.to_datetime(data_municipio).strftime('%A').upper(), str(dia_raw).upper()) if pd.notna(data_municipio) else str(dia_raw).upper()
 
-        # Lista de candidatos disponíveis para este dia/município
         candidatos = candidatos_df[
             (candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio))
         ].copy()
         candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
-
         if candidatos.empty:
             continue
 
-        # Ordenar por número de convocações para balancear
         candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
         candidatos = candidatos.sort_values('CONVOCACOES')
-
         pessoas_disponiveis = candidatos.copy()
+        sobrantes_dia = pd.DataFrame()
 
-        # Para cada operação do grupo
         for _, op in grupo.iterrows():
             categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
             quantidade = int(op['QUANTIDADE'])
 
-            # Filtrar candidatos pela categoria
             candidatos_op = pessoas_disponiveis[
-                candidatos['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
+                pessoas_disponiveis['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
             ]
+            candidatos_op = candidatos_op[candidatos_op['NOME'].apply(lambda n: pode_atuar_mesmo_municipio(n, municipio, data_municipio, historico_municipio))]
 
             if candidatos_op.empty:
                 continue
 
-            # Garantir pelo menos 1 presidente por operação
+            # Presidente mínimo
             presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
             if not presidentes_disponiveis.empty and quantidade >= 1:
                 presidente_selecionado = presidentes_disponiveis.sample(1, random_state=random.randint(0, 10000))
@@ -142,7 +131,6 @@ def processar_distribuicao(arquivo_excel):
             else:
                 selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
 
-            # Escolher presidente entre os selecionados
             presidentes = selecionados[selecionados['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
             presidente_nome = None
             for p in presidentes['NOME']:
@@ -154,7 +142,6 @@ def processar_distribuicao(arquivo_excel):
             if presidente_nome:
                 presidentes_ja_convocados.add(presidente_nome)
 
-            # Adiciona selecionados à lista final e atualiza históricos
             for _, pessoa in selecionados.iterrows():
                 distribuicoes.append({
                     "DIA": dia_semana_pt,
@@ -167,9 +154,33 @@ def processar_distribuicao(arquivo_excel):
                 contador_convocacoes[pessoa['NOME']] += 1
                 historico_municipio[pessoa['NOME']].append((municipio, data_municipio))
 
-            # Remove os selecionados da lista de pessoas disponíveis para as próximas operações do mesmo dia/município
             pessoas_disponiveis = pessoas_disponiveis[~pessoas_disponiveis['NOME'].isin(selecionados['NOME'])]
+            sobrantes_dia = pd.concat([sobrantes_dia, candidatos_op[~candidatos_op['NOME'].isin(selecionados['NOME'])]])
 
+            faltando = quantidade - len(selecionados)
+            if faltando > 0:
+                candidatos_faltantes = sobrantes_dia[
+                    sobrantes_dia['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias)) &
+                    sobrantes_dia['NOME'].apply(lambda n: pode_atuar_mesmo_municipio(n, municipio, data_municipio, historico_municipio))
+                ]
+                if not candidatos_faltantes.empty:
+                    adicionar = candidatos_faltantes.sample(min(faltando, len(candidatos_faltantes)), random_state=random.randint(0,10000))
+                    for _, pessoa in adicionar.iterrows():
+                        distribuicoes.append({
+                            "DIA": dia_semana_pt,
+                            "DATA": data_municipio.strftime("%d/%m/%y") if pd.notna(data_municipio) else "",
+                            "MUNICIPIO": municipio,
+                            "NOME": pessoa['NOME'],
+                            "CATEGORIA": pessoa['CATEGORIA'],
+                            "PRESIDENTE": "NAO"
+                        })
+                        contador_convocacoes[pessoa['NOME']] += 1
+                        historico_municipio[pessoa['NOME']].append((municipio, data_municipio))
+                    sobrantes_dia = sobrantes_dia[~sobrantes_dia['NOME'].isin(adicionar['NOME'])]
+
+    # ------------------------
+    # Criação dos dataframes finais
+    # ------------------------
     df_convocados = pd.DataFrame(distribuicoes)
 
     # Lista de não convocados
@@ -224,7 +235,6 @@ def processar_distribuicao(arquivo_excel):
 # ------------------------
 st.set_page_config(page_title="Distribuição Aleatória", page_icon="📊", layout="centered")
 
-# CSS moderno
 page_bg = """
 <style>
 .stApp {
@@ -270,7 +280,6 @@ page_bg = """
 """
 st.markdown(page_bg, unsafe_allow_html=True)
 
-# Layout inicial
 st.markdown(
     """
     <div class="main-card">
@@ -281,7 +290,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Upload do arquivo
 arquivo = st.file_uploader("📁 Envie a planilha (.xlsx)", type="xlsx")
 
 if arquivo:
@@ -307,7 +315,6 @@ if arquivo:
                 st.markdown("### 🚫 Não Convocados")
                 st.dataframe(df_nao_convocados, use_container_width=True)
 
-            # Download Bonito
             b64 = base64.b64encode(arquivo_excel.read()).decode()
             st.markdown(
                 f"""
