@@ -27,52 +27,33 @@ def normalizar_texto(txt):
 def esta_disponivel(row, data):
     """
     Verifica se a pessoa está disponível na data desejada.
-    Bloqueia qualquer pessoa que:
-    1. Tenha INICIO/FIM de indisponibilidade que inclua a data, ou
-    2. Tenha DIAS_INDISPONIBILIDADE dentro desse intervalo.
+    Bloqueia qualquer pessoa que tenha INICIO e FIM de indisponibilidade que inclua a data.
     """
     if pd.isna(data):
         return True
 
-    data = pd.to_datetime(data).normalize()
+    data = pd.to_datetime(data).normalize()  # normaliza a data para comparar
 
-    # Converte inicio/fim para datetime, ignora erros
-    inicio = pd.to_datetime(row.get('INICIO_INDISPONIBILIDADE', pd.NaT), errors='coerce')
-    fim = pd.to_datetime(row.get('FIM_INDISPONIBILIDADE', pd.NaT), errors='coerce')
-    dias_indisp = row.get('DIAS_INDISPONIBILIDADE', "")
+    inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
+    fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
 
     # Se a pessoa marcou "SIM" na coluna de indisponibilidade geral
     if str(inicio).strip().upper() == 'SIM':
         return False
 
-    # Bloqueio por intervalo de datas
-    bloqueio_por_data = False
+    # Tenta converter as colunas para datas (se forem strings)
+    try:
+        if pd.notna(inicio):
+            inicio = pd.to_datetime(inicio, dayfirst=True).normalize()
+        if pd.notna(fim):
+            fim = pd.to_datetime(fim, dayfirst=True).normalize()
+    except Exception:
+        return True  # Se não for data válida, ignora
+
+    # Bloqueia qualquer data dentro do intervalo de indisponibilidade
     if pd.notna(inicio) and pd.notna(fim):
         if inicio <= data <= fim:
-            bloqueio_por_data = True
-
-    # Bloqueio por dia da semana dentro do intervalo
-    bloqueio_por_dia = False
-    if bloqueio_por_data and pd.notna(dias_indisp) and dias_indisp != "":
-        dias_indisp = [d.strip().upper() for d in str(dias_indisp).split(',')]
-        dia_semana = data.strftime('%A').upper()
-        traducao = {
-            'MONDAY':'SEGUNDA',
-            'TUESDAY':'TERCA',
-            'WEDNESDAY':'QUARTA',
-            'THURSDAY':'QUINTA',
-            'FRIDAY':'SEXTA'
-        }
-        dia_semana_pt = traducao.get(dia_semana, dia_semana)
-        if dia_semana_pt in dias_indisp:
-            bloqueio_por_dia = True
-
-    if bloqueio_por_data and bloqueio_por_dia:
-        return False
-    elif bloqueio_por_data and dias_indisp == "":
-        return False
-    elif bloqueio_por_dia:
-        return False
+            return False
 
     return True
 
@@ -103,7 +84,6 @@ def processar_distribuicao(arquivo_excel):
     df['MUNICIPIO_ORIGEM'] = df.get('MUNICIPIO_ORIGEM', pd.Series("")).fillna("")
     df['INICIO_INDISPONIBILIDADE'] = df.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     df['FIM_INDISPONIBILIDADE'] = df.get('FIM_INDISPONIBILIDADE', pd.NaT)
-    df['DIAS_INDISPONIBILIDADE'] = df.get('DIAS_INDISPONIBILIDADE', pd.Series("")).fillna("")
 
     distribuicoes = []                  
     pessoas_agendadas = {}
@@ -113,98 +93,86 @@ def processar_distribuicao(arquivo_excel):
 
     dias_distribuicao = df[['DIA', 'DATA', 'MUNICIPIO', 'CATEGORIA', 'QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
-                        'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE', 'DIAS_INDISPONIBILIDADE']].dropna(subset=['NOME'])
+                        'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
     traducao_dias_eng = {'MONDAY':'SEGUNDA','TUESDAY':'TERCA','WEDNESDAY':'QUARTA','THURSDAY':'QUINTA','FRIDAY':'SEXTA'}
 
-    for _, row in dias_distribuicao.iterrows():
-        dia_raw = str(row['DIA']).strip().upper()
-        municipio = row['MUNICIPIO']
-        categorias_necessarias = [cat.strip() for cat in str(row['CATEGORIA']).split(',')]
-        try:
-            quantidade = int(row['QUANTIDADE'])
-        except ValueError:
-            continue
+    # ------------------------
+    # Loop de distribuição por dia e município (corrigido)
+    # ------------------------
+    for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA','MUNICIPIO','DATA']):
+        data_municipio = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
+        dia_semana_pt = traducao_dias_eng.get(pd.to_datetime(data_municipio).strftime('%A').upper(), str(dia_raw).upper()) if pd.notna(data_municipio) else str(dia_raw).upper()
 
-        data_municipio = pd.to_datetime(row.get('DATA', row['DIA']), dayfirst=True, errors='coerce')
-        dia_semana_pt = traducao_dias_eng.get(data_municipio.strftime('%A').upper(), dia_raw) if pd.notna(data_municipio) else dia_raw
-
+        # Lista de candidatos disponíveis para este dia/município
         candidatos = candidatos_df[
-            (candidatos_df['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))) &
             (candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio))
         ].copy()
-        # Aplica indisponibilidade, incluindo dias e período de datas
         candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
-
-        if dia_semana_pt in pessoas_agendadas:
-            candidatos = candidatos[~candidatos['NOME'].isin(pessoas_agendadas[dia_semana_pt])]
-
-        dia_anterior = data_municipio - timedelta(days=1) if pd.notna(data_municipio) else None
-        if dia_anterior:
-            def nao_consecutivo_mesmo_municipio(nome):
-                for mun, data_mun in historico_municipio.get(nome, []):
-                    if normalizar_texto(mun) == normalizar_texto(municipio) and data_mun == dia_anterior:
-                        return False
-                return True
-            candidatos = candidatos[candidatos['NOME'].apply(nao_consecutivo_mesmo_municipio)]
-
-        if pd.notna(data_municipio):
-            week_start = data_municipio - timedelta(days=data_municipio.weekday())
-            week_end = week_start + timedelta(days=6)
-            def nao_mesmo_municipio_semana(nome):
-                for mun, data_mun in historico_municipio.get(nome, []):
-                    if normalizar_texto(mun) == normalizar_texto(municipio) and week_start <= data_mun <= week_end:
-                        return False
-                return True
-            candidatos = candidatos[candidatos['NOME'].apply(nao_mesmo_municipio_semana)]
 
         if candidatos.empty:
             continue
 
-        candidatos_list = candidatos.assign(
-            CONVOCACOES=candidatos['NOME'].map(contador_convocacoes)
-        ).sort_values(by="CONVOCACOES", ascending=True)
+        # Ordenar por número de convocações para balancear
+        candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
+        candidatos = candidatos.sort_values('CONVOCACOES')
 
-        candidatos_list = candidatos_list.groupby("CONVOCACOES", group_keys=False).apply(
-            lambda x: x.sample(frac=1, random_state=random.randint(0, 10000))
-        ).reset_index(drop=True)
+        pessoas_disponiveis = candidatos.copy()
 
-        selecionados = candidatos_list.head(min(quantidade, len(candidatos_list)))
-        if selecionados.empty:
-            continue
+        # Para cada operação do grupo
+        for _, op in grupo.iterrows():
+            categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
+            quantidade = int(op['QUANTIDADE'])
 
-        presidentes = selecionados[selecionados['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
-        presidente_nome = None
-        for p in presidentes['NOME']:
-            if p not in presidentes_ja_convocados:
-                presidente_nome = p
-                break
-        if presidente_nome is None and not presidentes.empty:
-            presidente_nome = presidentes.iloc[0]['NOME']
+            # Filtrar candidatos pela categoria
+            candidatos_op = pessoas_disponiveis[
+                candidatos['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
+            ]
 
-        if presidente_nome:
-            presidentes_ja_convocados.add(presidente_nome)
+            if candidatos_op.empty:
+                continue
 
-        for _, pessoa in selecionados.iterrows():
-            distribuicoes.append({
-                "DIA": dia_semana_pt,
-                "DATA": data_municipio.strftime("%d/%m/%y") if pd.notna(data_municipio) else "",
-                "MUNICIPIO": municipio,
-                "NOME": pessoa['NOME'],
-                "CATEGORIA": pessoa['CATEGORIA'],
-                "PRESIDENTE": "SIM" if pessoa['NOME'] == presidente_nome else "NAO"
-            })
-            contador_convocacoes[pessoa['NOME']] += 1
-            historico_municipio[pessoa['NOME']].append((municipio, data_municipio))
+            # Garantir pelo menos 1 presidente por operação
+            presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
+            if not presidentes_disponiveis.empty and quantidade >= 1:
+                presidente_selecionado = presidentes_disponiveis.sample(1, random_state=random.randint(0, 10000))
+                candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
+                restantes = candidatos_op.sample(max(0, quantidade-1), random_state=random.randint(0, 10000))
+                selecionados = pd.concat([presidente_selecionado, restantes])
+            else:
+                selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
 
-        if dia_semana_pt not in pessoas_agendadas:
-            pessoas_agendadas[dia_semana_pt] = []
-        pessoas_agendadas[dia_semana_pt].extend(selecionados['NOME'].tolist())
+            # Escolher presidente entre os selecionados
+            presidentes = selecionados[selecionados['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
+            presidente_nome = None
+            for p in presidentes['NOME']:
+                if p not in presidentes_ja_convocados:
+                    presidente_nome = p
+                    break
+            if presidente_nome is None and not presidentes.empty:
+                presidente_nome = presidentes.iloc[0]['NOME']
+            if presidente_nome:
+                presidentes_ja_convocados.add(presidente_nome)
 
-    # ------------------------
-    # Lista de não convocados
-    # ------------------------
+            # Adiciona selecionados à lista final e atualiza históricos
+            for _, pessoa in selecionados.iterrows():
+                distribuicoes.append({
+                    "DIA": dia_semana_pt,
+                    "DATA": data_municipio.strftime("%d/%m/%y") if pd.notna(data_municipio) else "",
+                    "MUNICIPIO": municipio,
+                    "NOME": pessoa['NOME'],
+                    "CATEGORIA": pessoa['CATEGORIA'],
+                    "PRESIDENTE": "SIM" if pessoa['NOME'] == presidente_nome else "NAO"
+                })
+                contador_convocacoes[pessoa['NOME']] += 1
+                historico_municipio[pessoa['NOME']].append((municipio, data_municipio))
+
+            # Remove os selecionados da lista de pessoas disponíveis para as próximas operações do mesmo dia/município
+            pessoas_disponiveis = pessoas_disponiveis[~pessoas_disponiveis['NOME'].isin(selecionados['NOME'])]
+
     df_convocados = pd.DataFrame(distribuicoes)
+
+    # Lista de não convocados
     nao_convocados_lista = []
     for _, row in dias_distribuicao.iterrows():
         municipio = row['MUNICIPIO']
@@ -232,9 +200,7 @@ def processar_distribuicao(arquivo_excel):
 
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA"])
 
-    # ------------------------
     # Salva Excel
-    # ------------------------
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
@@ -254,7 +220,7 @@ def processar_distribuicao(arquivo_excel):
     return nome_arquivo_saida, df_convocados, df_nao_convocados, output
 
 # ------------------------
-# Interface Streamlit
+# Interface Streamlit (layout moderno)
 # ------------------------
 st.set_page_config(page_title="Distribuição Aleatória", page_icon="📊", layout="centered")
 
@@ -356,9 +322,3 @@ if arquivo:
                 """,
                 unsafe_allow_html=True
             )
-
-
-
-
-
-
