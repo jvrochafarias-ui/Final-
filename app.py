@@ -7,6 +7,16 @@ import base64
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 import random
+import locale
+
+# Definir locale para português (Windows/Linux)
+try:
+    locale.setlocale(locale.LC_TIME, 'pt_BR.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'portuguese')
+    except:
+        pass  # Caso não funcione, mantemos padrão
 
 # ------------------------
 # Funções auxiliares
@@ -28,11 +38,10 @@ def esta_disponivel(row, data):
     if pd.isna(data):
         return True
 
-    data = pd.to_datetime(data).normalize()
     inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
 
-    if str(inicio).strip().upper() == 'SIM':
+    if str(row.get('INDISPONIBILIDADE', 'NAO')).strip().upper() == 'SIM':
         return False
 
     try:
@@ -114,7 +123,7 @@ def processar_distribuicao(arquivo_excel):
     distribuicoes = []
     contador_convocacoes = {nome: 0 for nome in df['NOME'].unique()}
     presidentes_ja_convocados = set()
-    datas_convocados = {}
+    datas_convocados = {}  # Controle global por data
 
     dias_distribuicao = df[['DIA', 'DATA', 'MUNICIPIO', 'CATEGORIA', 'QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
@@ -123,15 +132,27 @@ def processar_distribuicao(arquivo_excel):
     traducao_dias_eng = {'MONDAY':'SEGUNDA','TUESDAY':'TERCA','WEDNESDAY':'QUARTA','THURSDAY':'QUINTA','FRIDAY':'SEXTA'}
 
     for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA','MUNICIPIO','DATA']):
-        data_municipio = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
-        dia_semana_pt = traducao_dias_eng.get(
-            pd.to_datetime(data_municipio).strftime('%A').upper(), str(dia_raw).upper()
-        ) if pd.notna(data_municipio) else str(dia_raw).upper()
+        # Converter a data (inglês ou português) para datetime
+        try:
+            data_municipio_dt = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
+        except Exception:
+            data_municipio_dt = pd.NaT
+
+        # Obter dia da semana em português
+        if pd.notna(data_municipio_dt):
+            dia_semana_pt = traducao_dias_eng.get(
+                data_municipio_dt.strftime('%A').upper(), str(dia_raw).upper()
+            )
+            # Formatar data em DD/MM/YYYY
+            data_str_pt = data_municipio_dt.strftime("%d/%m/%Y")
+        else:
+            dia_semana_pt = str(dia_raw).upper()
+            data_str_pt = ""
 
         candidatos = candidatos_df[
-            (candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio))
+            candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio)
         ].copy()
-        candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
+        candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)]
 
         if candidatos.empty:
             continue
@@ -148,7 +169,8 @@ def processar_distribuicao(arquivo_excel):
                 pessoas_disponiveis['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
             ]
 
-            data_key = data_municipio.strftime("%Y-%m-%d") if pd.notna(data_municipio) else ""
+            # Remove quem já foi convocado na data
+            data_key = data_municipio_dt.strftime("%Y-%m-%d") if pd.notna(data_municipio_dt) else ""
             convocados_na_data = datas_convocados.get(data_key, set())
             candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
 
@@ -162,7 +184,7 @@ def processar_distribuicao(arquivo_excel):
             for _, pessoa in selecionados.iterrows():
                 distribuicoes.append({
                     "DIA": dia_semana_pt,
-                    "DATA": data_municipio.strftime("%d/%m/%Y") if pd.notna(data_municipio) else "",
+                    "DATA": data_str_pt,
                     "MUNICIPIO": municipio,
                     "NOME": pessoa['NOME'],
                     "CATEGORIA": pessoa['CATEGORIA'],
@@ -179,32 +201,24 @@ def processar_distribuicao(arquivo_excel):
     df_convocados = pd.DataFrame(distribuicoes)
 
     # ------------------------
-    # Montagem dos não convocados (corrigido)
+    # Montagem dos não convocados
     # ------------------------
     nao_convocados_lista = []
-
     for _, row in candidatos_df.iterrows():
-        nome = row["NOME"]
-        categorias = [cat.strip() for cat in str(row['CATEGORIA']).split(',')]
+        convocado_datas = df_convocados[df_convocados['NOME'] == row['NOME']]['DATA'].tolist()
+        datas_unicas = dias_distribuicao['DATA'].dropna().unique()
+        for data_item in datas_unicas:
+            data_item_dt = pd.to_datetime(data_item, dayfirst=True)
+            data_item_str = data_item_dt.strftime("%d/%m/%Y")
+            if data_item_str not in convocado_datas:
+                dia_semana_pt = traducao_dias_eng.get(data_item_dt.strftime('%A').upper(), "")
+                nao_convocados_lista.append({
+                    "NOME": row['NOME'],
+                    "DIA": dia_semana_pt,
+                    "CATEGORIA": row['CATEGORIA']
+                })
 
-        dias_possiveis = dias_distribuicao[
-            dias_distribuicao['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias))
-        ]['DIA'].unique()
-
-        dias_convocados = df_convocados[df_convocados['NOME'] == nome]['DIA'].unique()
-
-        dias_nao_convocados = [dia for dia in dias_possiveis if dia not in dias_convocados]
-
-        for dia in dias_nao_convocados:
-            nao_convocados_lista.append({
-                "NOME": nome,
-                "DIA": dia,
-                "CATEGORIA": row["CATEGORIA"]
-            })
-
-    df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(
-        subset=["NOME", "DIA"]
-    )
+    df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA"])
 
     # ------------------------
     # Exportação para Excel
@@ -224,7 +238,8 @@ def processar_distribuicao(arquivo_excel):
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    nome_arquivo_saida = f'distribuicao_{datetime.now().strftime("%B").upper()}.xlsx'
+    # Nome do arquivo com mês em português
+    nome_arquivo_saida = f'distribuicao_{datetime.now().strftime("%B").lower()}.xlsx'
     return nome_arquivo_saida, df_convocados, df_nao_convocados, output
 
 # ------------------------
@@ -324,7 +339,6 @@ if arquivo:
                 """,
                 unsafe_allow_html=True
             )
-
 
 
 
