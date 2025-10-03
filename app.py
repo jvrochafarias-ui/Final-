@@ -25,15 +25,10 @@ def normalizar_texto(txt):
     return txt
 
 def esta_disponivel(row, data):
-    """
-    Verifica se a pessoa está disponível na data desejada.
-    Bloqueia qualquer pessoa que tenha INICIO e FIM de indisponibilidade que inclua a data.
-    """
     if pd.isna(data):
         return True
 
     data = pd.to_datetime(data).normalize()
-
     inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
 
@@ -58,11 +53,6 @@ def esta_disponivel(row, data):
 # Função para alocar candidatos em uma operação
 # ------------------------
 def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
-    """
-    Seleciona candidatos para a operação garantindo:
-      - exatamente 'quantidade' pessoas
-      - pelo menos 1 presidente
-    """
     if candidatos_op.empty:
         return pd.DataFrame(), None
 
@@ -72,13 +62,13 @@ def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
         presidente_selecionado = presidentes_disponiveis.sample(
             1, random_state=random.randint(0, 10000)
         )
-        restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])] \
-            .sample(max(0, quantidade - 1), random_state=random.randint(0, 10000))
+        restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
+        restantes = restantes.sample(min(len(restantes), max(0, quantidade - 1)),
+                                     random_state=random.randint(0, 10000))
         selecionados = pd.concat([presidente_selecionado, restantes])
     else:
-        selecionados = candidatos_op.sample(
-            min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000)
-        )
+        selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)),
+                                            random_state=random.randint(0, 10000))
 
     if len(selecionados) > quantidade:
         selecionados = selecionados.sample(quantidade, random_state=random.randint(0, 10000))
@@ -124,6 +114,7 @@ def processar_distribuicao(arquivo_excel):
     distribuicoes = []
     contador_convocacoes = {nome: 0 for nome in df['NOME'].unique()}
     presidentes_ja_convocados = set()
+    datas_convocados = {}
 
     dias_distribuicao = df[['DIA', 'DATA', 'MUNICIPIO', 'CATEGORIA', 'QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
@@ -157,6 +148,10 @@ def processar_distribuicao(arquivo_excel):
                 pessoas_disponiveis['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
             ]
 
+            data_key = data_municipio.strftime("%Y-%m-%d") if pd.notna(data_municipio) else ""
+            convocados_na_data = datas_convocados.get(data_key, set())
+            candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
+
             if candidatos_op.empty:
                 continue
 
@@ -167,7 +162,7 @@ def processar_distribuicao(arquivo_excel):
             for _, pessoa in selecionados.iterrows():
                 distribuicoes.append({
                     "DIA": dia_semana_pt,
-                    "DATA": data_municipio.strftime("%d/%m/%y") if pd.notna(data_municipio) else "",
+                    "DATA": data_municipio.strftime("%d/%m/%Y") if pd.notna(data_municipio) else "",
                     "MUNICIPIO": municipio,
                     "NOME": pessoa['NOME'],
                     "CATEGORIA": pessoa['CATEGORIA'],
@@ -175,46 +170,40 @@ def processar_distribuicao(arquivo_excel):
                 })
                 contador_convocacoes[pessoa['NOME']] += 1
 
+                if data_key not in datas_convocados:
+                    datas_convocados[data_key] = set()
+                datas_convocados[data_key].add(pessoa['NOME'])
+
             pessoas_disponiveis = pessoas_disponiveis[~pessoas_disponiveis['NOME'].isin(selecionados['NOME'])]
 
     df_convocados = pd.DataFrame(distribuicoes)
 
     # ------------------------
-    # Montagem dos não convocados (ajustado: sem DATA nem CATEGORIAS)
+    # Montagem dos não convocados (corrigido)
     # ------------------------
     nao_convocados_lista = []
 
-    for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA','MUNICIPIO','DATA']):
-        data_municipio = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
-        dia_semana_pt = traducao_dias_eng.get(
-            pd.to_datetime(data_municipio).strftime('%A').upper(), str(dia_raw).upper()
-        ) if pd.notna(data_municipio) else str(dia_raw).upper()
+    for _, row in candidatos_df.iterrows():
+        nome = row["NOME"]
+        categorias = [cat.strip() for cat in str(row['CATEGORIA']).split(',')]
 
-        for _, op in grupo.iterrows():
-            categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
-            quantidade = int(op['QUANTIDADE'])
+        dias_possiveis = dias_distribuicao[
+            dias_distribuicao['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias))
+        ]['DIA'].unique()
 
-            candidatos_op = candidatos_df[
-                candidatos_df['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))
-            ]
-            candidatos_op = candidatos_op[candidatos_op.apply(lambda x: esta_disponivel(x, data_municipio), axis=1)]
+        dias_convocados = df_convocados[df_convocados['NOME'] == nome]['DIA'].unique()
 
-            convocados_op = df_convocados[
-                (df_convocados["MUNICIPIO"] == municipio) &
-                (df_convocados["DIA"] == dia_semana_pt)
-            ]["NOME"].tolist()
+        dias_nao_convocados = [dia for dia in dias_possiveis if dia not in dias_convocados]
 
-            for _, row in candidatos_op.iterrows():
-                if row["NOME"] not in convocados_op:
-                    nao_convocados_lista.append({
-                        "NOME": row["NOME"],
-                        "DIA": dia_semana_pt,
-                        "MUNICIPIO": municipio,
-                        "PRESIDENTE": row["PRESIDENTE_DE_BANCA"]
-                    })
+        for dia in dias_nao_convocados:
+            nao_convocados_lista.append({
+                "NOME": nome,
+                "DIA": dia,
+                "CATEGORIA": row["CATEGORIA"]
+            })
 
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(
-        subset=["NOME", "DIA", "MUNICIPIO"]
+        subset=["NOME", "DIA"]
     )
 
     # ------------------------
@@ -335,6 +324,7 @@ if arquivo:
                 """,
                 unsafe_allow_html=True
             )
+
 
 
 
