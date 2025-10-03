@@ -40,11 +40,6 @@ def esta_disponivel(row, data):
     inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
 
-    # Se qualquer uma das datas é NaT, considera como disponível
-    if pd.isna(inicio) and pd.isna(fim):
-        return True
-
-    # Converte datas para datetime se não forem NaT
     if pd.notna(inicio):
         try:
             inicio = pd.to_datetime(inicio, dayfirst=True, errors='coerce')
@@ -56,7 +51,6 @@ def esta_disponivel(row, data):
         except:
             fim = pd.NaT
 
-    # Se a pessoa está no período de indisponibilidade
     if pd.notna(inicio) and pd.notna(fim):
         if inicio <= data <= fim:
             return False
@@ -119,7 +113,7 @@ def processar_distribuicao(arquivo_excel):
     # Normalizar colunas
     df.columns = [normalizar_coluna(col) for col in df.columns]
 
-    # Garantir coluna NOME
+    # Normalizar coluna NOME
     colunas_possiveis_nome = ['NOME','NOME_COMPLETO','NOME_PESSOA']
     for col in colunas_possiveis_nome:
         if col in df.columns:
@@ -129,7 +123,7 @@ def processar_distribuicao(arquivo_excel):
         st.error("❌ Erro: coluna de nomes não encontrada")
         return None, pd.DataFrame(), pd.DataFrame(), io.BytesIO()
 
-    # Normalizar e preencher colunas obrigatórias
+    # Preencher colunas obrigatórias
     for col in ['INDISPONIBILIDADE','PRESIDENTE_DE_BANCA','MUNICIPIO_ORIGEM']:
         if col not in df.columns:
             df[col] = 'NAO' if col != 'MUNICIPIO_ORIGEM' else ''
@@ -137,47 +131,46 @@ def processar_distribuicao(arquivo_excel):
     for col in ['INICIO_INDISPONIBILIDADE','FIM_INDISPONIBILIDADE']:
         if col not in df.columns:
             df[col] = pd.NaT
+        else:
+            df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
 
-    # Estruturas de controle
     distribuicoes = []
     contador_convocacoes = {nome:0 for nome in df['NOME'].unique()}
     presidentes_ja_convocados = set()
     datas_convocados = {}
 
-    # Separar dias e candidatos
     dias_distribuicao = df[['DIA','DATA','MUNICIPIO','CATEGORIA','QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME','CATEGORIA','INDISPONIBILIDADE','PRESIDENTE_DE_BANCA','MUNICIPIO_ORIGEM','INICIO_INDISPONIBILIDADE','FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
-    # -----------------------
-    # Filtrar candidatos indisponíveis de forma definitiva
-    # -----------------------
-    candidatos_df = candidatos_df[candidatos_df.apply(lambda x: esta_disponivel(x, datetime.now()), axis=1)]
-
-    traducao_dias_eng = {'MONDAY':'SEGUNDA','TUESDAY':'TERCA','WEDNESDAY':'QUARTA','THURSDAY':'QUINTA','FRIDAY':'SEXTA'}
-
-    # -----------------------
-    # Distribuição principal
-    # -----------------------
     for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA','MUNICIPIO','DATA']):
         data_municipio_dt = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
         if pd.isna(data_municipio_dt):
             continue
-        dia_semana_pt = traducao_dias_eng.get(data_municipio_dt.strftime('%A').upper(), str(dia_raw).upper())
+        dia_semana_pt = traduzir_dia(data_municipio_dt)
         data_str_pt = data_municipio_dt.strftime("%d/%m/%Y")
 
-        candidatos = candidatos_df[candidatos_df['MUNICIPIO_ORIGEM'].apply(normalizar_texto)!=normalizar_texto(municipio)]
-        candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)]
+        # -----------------------
+        # FILTRAR PESSOAS INDISPONÍVEIS ANTES DA CONVOCAÇÃO
+        # -----------------------
+        candidatos = candidatos_df.copy()
+        candidatos = candidatos[
+            candidatos.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)
+        ]
+        candidatos = candidatos[candidatos['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio)]
+
         if candidatos.empty:
             continue
+
         candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
-        candidatos = candidatos.sort_values('CONVOCACOES')
-        pessoas_disponiveis = candidatos.copy()
+        pessoas_disponiveis = candidatos.sort_values('CONVOCACOES')
 
         for _, op in grupo.iterrows():
             categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
             quantidade = int(op['QUANTIDADE'])
 
-            candidatos_op = pessoas_disponiveis[pessoas_disponiveis['CATEGORIA'].apply(lambda x:any(cat in str(x) for cat in categorias_necessarias))]
+            candidatos_op = pessoas_disponiveis[
+                pessoas_disponiveis['CATEGORIA'].apply(lambda x:any(cat in str(x) for cat in categorias_necessarias))
+            ]
             data_key = data_municipio_dt.strftime("%Y-%m-%d")
             convocados_na_data = datas_convocados.get(data_key,set())
             candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
@@ -201,22 +194,16 @@ def processar_distribuicao(arquivo_excel):
 
             pessoas_disponiveis = pessoas_disponiveis[~pessoas_disponiveis['NOME'].isin(selecionados['NOME'])]
 
-    df_convocados = pd.DataFrame(distribuicoes)
-
     # -----------------------
-    # Montagem dos não convocados
+    # Não convocados
     # -----------------------
     nao_convocados_lista = []
     for _, row in candidatos_df.iterrows():
-        convocado_datas = df_convocados[df_convocados['NOME']==row['NOME']]['DATA'].tolist()
-        datas_unicas = dias_distribuicao['DATA'].dropna().unique()
-        for data_item in datas_unicas:
+        datas_validas = [d for d in dias_distribuicao['DATA'].dropna().unique() if esta_disponivel(row, pd.to_datetime(d, dayfirst=True, errors='coerce'))]
+        for data_item in datas_validas:
             data_item_dt = pd.to_datetime(data_item, dayfirst=True, errors='coerce')
-            if pd.isna(data_item_dt):
-                continue
-            if not esta_disponivel(row, data_item_dt):
-                continue  # 🔹 Excluir quem está em férias do não convocado
             data_item_str = data_item_dt.strftime("%d/%m/%Y")
+            convocado_datas = [x['DATA'] for x in distribuicoes if x['NOME']==row['NOME']]
             if data_item_str not in convocado_datas:
                 dia_semana_pt = traduzir_dia(data_item_dt)
                 nao_convocados_lista.append({
@@ -225,7 +212,8 @@ def processar_distribuicao(arquivo_excel):
                     "CATEGORIA": row['CATEGORIA']
                 })
 
-    df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME","DIA"])
+    df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME","DIA","CATEGORIA"])
+    df_convocados = pd.DataFrame(distribuicoes)
 
     # -----------------------
     # Exportação Excel
@@ -246,6 +234,7 @@ def processar_distribuicao(arquivo_excel):
     wb.save(output)
     output.seek(0)
     nome_arquivo_saida = f'distribuicao_{datetime.now().strftime("%B").lower()}.xlsx'
+
     return nome_arquivo_saida, df_convocados, df_nao_convocados, output
 
 # -----------------------
@@ -345,10 +334,3 @@ if arquivo:
                 """,
                 unsafe_allow_html=True
             )
-
-
-
-
-
-
-
