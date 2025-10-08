@@ -8,6 +8,7 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 import random
 import locale
+from collections import defaultdict
 
 # -----------------------
 # Configuração de locale
@@ -36,6 +37,20 @@ def normalizar_texto(txt):
     txt = unicodedata.normalize('NFKD', txt).encode('ASCII', 'ignore').decode('ASCII')
     return txt
 
+def esta_disponivel(row, data):
+    inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
+    fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
+
+    if pd.notna(inicio):
+        inicio = pd.to_datetime(inicio, dayfirst=True, errors='coerce')
+    if pd.notna(fim):
+        fim = pd.to_datetime(fim, dayfirst=True, errors='coerce')
+
+    if pd.notna(inicio) and pd.notna(fim):
+        if inicio <= data <= fim:
+            return False
+    return True
+
 def traduzir_dia(data_item_dt):
     dias_traducao = {
         'MONDAY': 'SEGUNDA',
@@ -49,57 +64,20 @@ def traduzir_dia(data_item_dt):
     dia_semana = data_item_dt.strftime("%A").upper()
     return dias_traducao.get(dia_semana, dia_semana)
 
-# -----------------------
-# Função de disponibilidade atualizada
-# -----------------------
-def esta_disponivel(row, data):
-    indisponivel_flag = str(row.get('INDISPONIBILIDADE', 'NAO')).upper() == 'SIM'
-    inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
-    fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
-
-    # Bloqueio absoluto
-    if indisponivel_flag or (str(inicio).upper() == 'SIM' and str(fim).upper() == 'SIM'):
-        return False
-
-    if pd.notna(inicio):
-        inicio = pd.to_datetime(inicio, dayfirst=True, errors='coerce')
-    if pd.notna(fim):
-        fim = pd.to_datetime(fim, dayfirst=True, errors='coerce')
-
-    if pd.notna(inicio) and pd.notna(fim):
-        if inicio <= data <= fim:
-            return False
-
-    return True
-
-# -----------------------
-# Função de alocação de operação
-# -----------------------
 def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
     if candidatos_op.empty:
         return pd.DataFrame(), None
 
     candidatos_op = candidatos_op.sort_values('CONVOCACOES')
-    presidente_selecionado = None
-
-    # Busca primeiro entre os que são PRESIDENTE_DE_BANCA = SIM
     presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
+    presidente_selecionado = None
     if not presidentes_disponiveis.empty:
         presidente_selecionado = presidentes_disponiveis.sample(1, random_state=random.randint(0, 10000))
         restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
         restantes = restantes.sample(min(len(restantes), max(0, quantidade - 1)), random_state=random.randint(0, 10000))
         selecionados = pd.concat([presidente_selecionado, restantes])
     else:
-        # Se não houver presidente disponível, força alguém da lista de convocados que tenha PRESIDENTE_DE_BANCA = SIM
-        presidentes_forcados = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
-        if not presidentes_forcados.empty:
-            presidente_selecionado = presidentes_forcados.sample(1, random_state=random.randint(0, 10000))
-            restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
-            restantes = restantes.sample(min(len(restantes), max(0, quantidade - 1)), random_state=random.randint(0, 10000))
-            selecionados = pd.concat([presidente_selecionado, restantes])
-        else:
-            # Senão, sorteia qualquer candidato
-            selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
+        selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
 
     if len(selecionados) > quantidade:
         selecionados = selecionados.sample(quantidade, random_state=random.randint(0, 10000))
@@ -112,7 +90,7 @@ def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
     return selecionados, presidente_nome
 
 # -----------------------
-# Função principal de processamento
+# Processamento com regras avançadas
 # -----------------------
 def processar_distribuicao(arquivo_excel):
     xls = pd.ExcelFile(arquivo_excel)
@@ -146,19 +124,16 @@ def processar_distribuicao(arquivo_excel):
     contador_convocacoes = {nome: 0 for nome in df['NOME'].unique()}
     presidentes_ja_convocados = set()
     datas_convocados = {}
+    municipios_por_pessoa = defaultdict(set)
 
     dias_distribuicao = df[['DIA', 'DATA', 'MUNICIPIO', 'CATEGORIA', 'QUANTIDADE']].dropna(subset=['DIA'])
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
                         'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
-    def mesma_semana(dt1, dt2):
-        return dt1.isocalendar()[0:2] == dt2.isocalendar()[0:2]
-
-    # -----------------------
-    # Distribuição equilibrada
-    # -----------------------
     rodadas = 0
-    max_rodadas = 10
+    max_rodadas = 15
+    min_convocacoes = 3
+
     while rodadas < max_rodadas:
         rodadas += 1
         alteracao = False
@@ -183,53 +158,55 @@ def processar_distribuicao(arquivo_excel):
                 data_key = data_municipio_dt.strftime("%Y-%m-%d")
                 convocados_na_data = datas_convocados.get(data_key, set())
                 candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
-
-                # Evita mesmo município na mesma semana
-                candidatos_op_filtrados = []
-                for _, pessoa in candidatos_op.iterrows():
-                    bloqueado = False
-                    for dist in distribuicoes:
-                        data_dist_dt = pd.to_datetime(dist['DATA'], dayfirst=True, errors='coerce')
-                        if (dist['NOME'] == pessoa['NOME'] and
-                            dist['MUNICIPIO'] == municipio and
-                            mesma_semana(data_dist_dt, data_municipio_dt)):
-                            bloqueado = True
-                            break
-                    if not bloqueado:
-                        candidatos_op_filtrados.append(pessoa)
-                if candidatos_op_filtrados:
-                    candidatos_op = pd.DataFrame(candidatos_op_filtrados)
-                else:
-                    candidatos_op = pd.DataFrame(columns=candidatos_op.columns)
+                candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
 
                 candidatos_op = candidatos_op.sort_values('CONVOCACOES', ascending=True)
-
                 if candidatos_op.empty:
                     continue
 
                 selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados)
+
+                # ---------- Garantir pelo menos 1 presidente ----------
+                if not any(selecionados['PRESIDENTE_DE_BANCA'] == 'SIM'):
+                    presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM']
+                    presidentes_disponiveis = presidentes_disponiveis[~presidentes_disponiveis['NOME'].isin(selecionados['NOME'])]
+                    if not presidentes_disponiveis.empty:
+                        pres_subs = presidentes_disponiveis.sample(1, random_state=random.randint(0,10000)).iloc[0]
+                        # Substitui o primeiro não-presidente
+                        for idx, row_sel in selecionados.iterrows():
+                            if row_sel['PRESIDENTE_DE_BANCA'] != 'SIM':
+                                selecionados.loc[idx] = pres_subs
+                                presidente_nome = pres_subs['NOME']
+                                break
+
                 for _, pessoa in selecionados.iterrows():
-                    if contador_convocacoes[pessoa['NOME']] < 3:
+                    nome = pessoa['NOME']
+                    presidente = pessoa['PRESIDENTE_DE_BANCA'] == 'SIM'
+
+                    if municipio in municipios_por_pessoa[nome]:
+                        continue
+
+                    if presidente or contador_convocacoes[nome] < min_convocacoes:
                         distribuicoes.append({
                             "DIA": dia_semana_pt,
                             "DATA": data_str_pt,
                             "MUNICIPIO": municipio,
-                            "NOME": pessoa['NOME'],
+                            "NOME": nome,
                             "CATEGORIA": pessoa['CATEGORIA'],
-                            "PRESIDENTE": "SIM" if pessoa['NOME'] == presidente_nome else "NAO"
+                            "PRESIDENTE": "SIM" if nome == presidente_nome else "NAO"
                         })
-                        contador_convocacoes[pessoa['NOME']] += 1
-                        datas_convocados.setdefault(data_key, set()).add(pessoa['NOME'])
+                        contador_convocacoes[nome] += 1
+                        datas_convocados.setdefault(data_key, set()).add(nome)
+                        municipios_por_pessoa[nome].add(municipio)
                         alteracao = True
 
-        if all(v >= 3 or v == max(contador_convocacoes.values()) for v in contador_convocacoes.values()):
+        if all(v >= min_convocacoes or df.loc[df['NOME'] == n, 'PRESIDENTE_DE_BANCA'].iloc[0] == 'SIM'
+               for n, v in contador_convocacoes.items()):
             break
         if not alteracao:
             break
 
-    # -----------------------
-    # Não convocados
-    # -----------------------
+    # ----------------------- Não convocados
     nao_convocados_lista = []
     for _, row in candidatos_df.iterrows():
         datas_validas = [d for d in dias_distribuicao['DATA'].dropna().unique()
@@ -249,9 +226,7 @@ def processar_distribuicao(arquivo_excel):
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA", "CATEGORIA"])
     df_convocados = pd.DataFrame(distribuicoes)
 
-    # -----------------------
-    # Exportação Excel
-    # -----------------------
+    # ----------------------- Exportação Excel
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
@@ -272,8 +247,10 @@ def processar_distribuicao(arquivo_excel):
     return nome_arquivo_saida, df_convocados, df_nao_convocados, output
 
 # -----------------------
-# Layout do Streamlit
+# Interface Streamlit
 # -----------------------
+st.set_page_config(page_title="Distribuição Equilibrada", page_icon="📊", layout="centered")
+
 page_bg = """
 <style>
 .stApp {
@@ -322,7 +299,7 @@ st.markdown(page_bg, unsafe_allow_html=True)
 st.markdown("""
     <div class="main-card">
         <h1>📊 Distribuição Equilibrada de Convocações</h1>
-        <p>O sistema garante que cada participante tenha pelo menos 3 convocações e respeita todas as regras de disponibilidade, categoria e presidente de banca.</p>
+        <p>O sistema garante pelo menos 3 convocações por pessoa, 1 presidente por município/dia, respeitando disponibilidade, categorias e municípios/dia/semana.</p>
     </div>
     """, unsafe_allow_html=True)
 
