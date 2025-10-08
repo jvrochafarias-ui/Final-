@@ -69,8 +69,10 @@ def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
         return pd.DataFrame(), None
 
     candidatos_op = candidatos_op.sort_values('CONVOCACOES')
+
     presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
     presidente_selecionado = None
+
     if not presidentes_disponiveis.empty:
         presidente_selecionado = presidentes_disponiveis.sample(1, random_state=random.randint(0, 10000))
         restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
@@ -97,7 +99,6 @@ def processar_distribuicao(arquivo_excel):
     sheet_name = 'Planilha1' if 'Planilha1' in xls.sheet_names else xls.sheet_names[0]
     df = pd.read_excel(xls, sheet_name=sheet_name)
 
-    # Normalizar colunas
     df.columns = [normalizar_coluna(col) for col in df.columns]
 
     colunas_possiveis_nome = ['NOME', 'NOME_COMPLETO', 'NOME_PESSOA']
@@ -109,7 +110,6 @@ def processar_distribuicao(arquivo_excel):
         st.error("❌ Erro: coluna de nomes não encontrada")
         return None, pd.DataFrame(), pd.DataFrame(), io.BytesIO()
 
-    # Preencher colunas obrigatórias
     for col in ['INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA', 'MUNICIPIO_ORIGEM']:
         if col not in df.columns:
             df[col] = 'NAO' if col != 'MUNICIPIO_ORIGEM' else ''
@@ -166,13 +166,12 @@ def processar_distribuicao(arquivo_excel):
 
                 selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados)
 
-                # ---------- Garantir pelo menos 1 presidente ----------
+                # Garantir pelo menos 1 presidente se houver disponível
                 if not any(selecionados['PRESIDENTE_DE_BANCA'] == 'SIM'):
                     presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM']
                     presidentes_disponiveis = presidentes_disponiveis[~presidentes_disponiveis['NOME'].isin(selecionados['NOME'])]
                     if not presidentes_disponiveis.empty:
                         pres_subs = presidentes_disponiveis.sample(1, random_state=random.randint(0,10000)).iloc[0]
-                        # Substitui o primeiro não-presidente
                         for idx, row_sel in selecionados.iterrows():
                             if row_sel['PRESIDENTE_DE_BANCA'] != 'SIM':
                                 selecionados.loc[idx] = pres_subs
@@ -220,11 +219,46 @@ def processar_distribuicao(arquivo_excel):
                 nao_convocados_lista.append({
                     "NOME": row['NOME'],
                     "DIA": dia_semana_pt,
-                    "CATEGORIA": row['CATEGORIA']
+                    "CATEGORIA": row['CATEGORIA'],
+                    "MUNICIPIO_ORIGEM": row['MUNICIPIO_ORIGEM'],
+                    "PRESIDENTE_DE_BANCA": row['PRESIDENTE_DE_BANCA'],
+                    "DATA": data_item_str
                 })
 
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA", "CATEGORIA"])
     df_convocados = pd.DataFrame(distribuicoes)
+
+    # ----------------------- Garantir presidente de banca (último caso)
+    correcao_ultimocaso = []
+
+    for (dia, municipio), grupo in df_convocados.groupby(['DIA', 'MUNICIPIO']):
+        if not any(grupo['PRESIDENTE'] == 'SIM'):
+            candidatos_pres = df_nao_convocados[
+                (df_nao_convocados['MUNICIPIO_ORIGEM'] != municipio) &
+                (df_nao_convocados['PRESIDENTE_DE_BANCA'] == 'SIM')
+            ]
+            if not candidatos_pres.empty:
+                pres_subs = candidatos_pres.sample(1, random_state=random.randint(0, 10000)).iloc[0]
+                df_convocados = pd.concat([
+                    df_convocados,
+                    pd.DataFrame([{
+                        "DIA": dia,
+                        "DATA": pres_subs['DATA'],
+                        "MUNICIPIO": municipio,
+                        "NOME": pres_subs['NOME'],
+                        "CATEGORIA": pres_subs['CATEGORIA'],
+                        "PRESIDENTE": "SIM"
+                    }])
+                ], ignore_index=True)
+                df_nao_convocados = df_nao_convocados[df_nao_convocados['NOME'] != pres_subs['NOME']]
+                correcao_ultimocaso.append({
+                    "DIA": dia,
+                    "MUNICIPIO": municipio,
+                    "NOME": pres_subs['NOME'],
+                    "CATEGORIA": pres_subs['CATEGORIA']
+                })
+
+    df_correcao_ultimocaso = pd.DataFrame(correcao_ultimocaso)
 
     # ----------------------- Exportação Excel
     wb = Workbook()
@@ -238,6 +272,12 @@ def processar_distribuicao(arquivo_excel):
     for r_idx, row in enumerate(dataframe_to_rows(df_nao_convocados, index=False, header=True), 1):
         for c_idx, value in enumerate(row, 1):
             ws2.cell(row=r_idx, column=c_idx, value=value)
+
+    if not df_correcao_ultimocaso.empty:
+        ws3 = wb.create_sheet("Correcoes Ultimo Caso")
+        for r_idx, row in enumerate(dataframe_to_rows(df_correcao_ultimocaso, index=False, header=True), 1):
+            for c_idx, value in enumerate(row, 1):
+                ws3.cell(row=r_idx, column=c_idx, value=value)
 
     output = io.BytesIO()
     wb.save(output)
@@ -337,3 +377,4 @@ if arquivo:
                     </a>
                 </div>
             """, unsafe_allow_html=True)
+
