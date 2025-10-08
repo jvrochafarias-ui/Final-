@@ -95,7 +95,7 @@ def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
     return selecionados, presidente_nome
 
 # -----------------------
-# Processamento da distribuição com equilíbrio
+# Processamento da distribuição
 # -----------------------
 def processar_distribuicao(arquivo_excel):
     xls = pd.ExcelFile(arquivo_excel)
@@ -135,10 +135,10 @@ def processar_distribuicao(arquivo_excel):
                         'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
     # -----------------------
-    # Múltiplas passagens até equilíbrio (mínimo 3 convocações)
+    # Rodadas de distribuição
     # -----------------------
     rodadas = 0
-    max_rodadas = 10  # evita loop infinito
+    max_rodadas = 10
     while rodadas < max_rodadas:
         rodadas += 1
         alteracao = False
@@ -164,6 +164,18 @@ def processar_distribuicao(arquivo_excel):
                 convocados_na_data = datas_convocados.get(data_key, set())
                 candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
 
+                # -----------------------
+                # NOVA REGRA: Não repetir cidade na mesma semana
+                # -----------------------
+                semana_atual = data_municipio_dt.isocalendar()[1]
+                convocacoes_mesma_semana = [
+                    x for x in distribuicoes
+                    if x['MUNICIPIO'] == municipio and
+                    pd.to_datetime(x['DATA'], dayfirst=True, errors='coerce').isocalendar()[1] == semana_atual
+                ]
+                nomes_ja_foram_mesma_semana = [x['NOME'] for x in convocacoes_mesma_semana]
+                candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(nomes_ja_foram_mesma_semana)]
+
                 # Prioriza quem tem menos de 3 convocações
                 candidatos_op = candidatos_op.sort_values('CONVOCACOES', ascending=True)
 
@@ -185,7 +197,6 @@ def processar_distribuicao(arquivo_excel):
                         datas_convocados.setdefault(data_key, set()).add(pessoa['NOME'])
                         alteracao = True
 
-        # Sai se todo mundo já tiver 3 convocações (ou o máximo possível)
         if all(v >= 3 or v == max(contador_convocacoes.values()) for v in contador_convocacoes.values()):
             break
         if not alteracao:
@@ -288,7 +299,7 @@ st.markdown(page_bg, unsafe_allow_html=True)
 st.markdown("""
     <div class="main-card">
         <h1>📊 Distribuição Equilibrada de Convocações</h1>
-        <p>O sistema busca garantir que a maioria dos participantes tenha pelo menos 3 convocações, respeitando todas as regras de disponibilidade e categoria.</p>
+        <p>Agora com regra de não repetir município na mesma semana.</p>
     </div>
     """, unsafe_allow_html=True)
 
