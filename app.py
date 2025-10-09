@@ -58,62 +58,54 @@ def traduzir_dia(data_item_dt):
     dia_semana = data_item_dt.strftime("%A").upper()
     return dias_traducao.get(dia_semana, dia_semana)
 
+# ----------------------- Nova função de alocação balanceada -----------------------
 def alocar_operacao(candidatos_op, quantidade, contador_convocacoes, presidente_forcado=False):
     """
-    Seleciona exatamente a quantidade necessária e garante 1 presidente por operação.
-    Balanceamento matemático: prioriza pessoas com menos convocações.
+    Seleciona exatamente a quantidade necessária, garantindo 1 presidente por operação
+    e distribuindo de forma equilibrada matematicamente.
     """
     if candidatos_op.empty:
         return pd.DataFrame(), None
 
-    # Separar presidentes e não presidentes
-    presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM']
-    nao_presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] != 'SIM']
-
-    # Ordenar candidatos por menor número de convocações
     candidatos_op = candidatos_op.copy()
     candidatos_op['CONVOCACOES'] = candidatos_op['NOME'].map(contador_convocacoes)
-    candidatos_op = candidatos_op.sort_values('CONVOCACOES')
+    
+    # Separar presidentes e não presidentes
+    presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM'].sort_values('CONVOCACOES')
+    nao_presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] != 'SIM'].sort_values('CONVOCACOES')
 
     selecionados = pd.DataFrame()
     presidente_nome = None
 
-    # Escolher presidente
+    # Escolher 1 presidente
     if not presidentes.empty:
-        presidente = presidentes.sort_values('CONVOCACOES').head(1)
+        presidente = presidentes.head(1)
         presidente_nome = presidente.iloc[0]['NOME']
         selecionados = presidente
-        restante = quantidade - 1
-        if restante > 0 and not nao_presidentes.empty:
-            adicionais = nao_presidentes.sort_values('CONVOCACOES').head(restante)
-            selecionados = pd.concat([selecionados, adicionais])
-    else:
-        if presidente_forcado:
-            candidato = candidatos_op.head(1)
-            presidente_nome = candidato.iloc[0]['NOME']
-            candidato.loc[:, 'PRESIDENTE_DE_BANCA'] = 'SIM'
-            selecionados = candidato
-            restante = quantidade - 1
-            if restante > 0:
-                adicionais = candidatos_op[~candidatos_op['NOME'].isin([presidente_nome])].head(restante)
-                selecionados = pd.concat([selecionados, adicionais])
-        else:
-            selecionados = candidatos_op.head(quantidade)
+    elif presidente_forcado:
+        # Se não houver presidente disponível, escolher alguém e forçar
+        candidato = candidatos_op.head(1)
+        presidente_nome = candidato.iloc[0]['NOME']
+        candidato.loc[:, 'PRESIDENTE_DE_BANCA'] = 'SIM'
+        selecionados = candidato
 
-    # Garantir quantidade exata
-    if len(selecionados) < quantidade:
-        faltando = quantidade - len(selecionados)
-        candidatos_restantes = candidatos_op[~candidatos_op['NOME'].isin(selecionados['NOME'])]
-        if not candidatos_restantes.empty:
-            adicionais = candidatos_restantes.head(faltando)
-            selecionados = pd.concat([selecionados, adicionais])
-        if len(selecionados) < quantidade:
-            faltando = quantidade - len(selecionados)
-            repeticoes = selecionados.sample(faltando, replace=True, random_state=random.randint(0,10000))
-            selecionados = pd.concat([selecionados, repeticoes])
+    # Determinar quantos adicionais são necessários
+    restantes = quantidade - len(selecionados)
 
-    if len(selecionados) > quantidade:
-        selecionados = selecionados.sample(quantidade, random_state=random.randint(0,10000))
+    if restantes > 0:
+        # Filtrar candidatos restantes, sem repetir o presidente
+        candidatos_restantes = candidatos_op[~candidatos_op['NOME'].isin([presidente_nome])]
+        candidatos_restantes = candidatos_restantes.sort_values('CONVOCACOES')
+        
+        # Se não houver candidatos suficientes, permitir repetição balanceada
+        while len(candidatos_restantes) < restantes:
+            candidatos_restantes = pd.concat([candidatos_restantes, candidatos_restantes])
+
+        adicionais = candidatos_restantes.head(restantes)
+        selecionados = pd.concat([selecionados, adicionais])
+
+    # Garantir aleatoriedade sem perder equilíbrio
+    selecionados = selecionados.sample(frac=1, random_state=random.randint(0, 10000)).reset_index(drop=True)
 
     return selecionados, presidente_nome
 
@@ -154,7 +146,14 @@ def processar_distribuicao(arquivo_excel):
                         'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
     # ---------------- Loop principal ----------------
-    for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA', 'MUNICIPIO', 'DATA']):
+    for _, op in dias_distribuicao.iterrows():
+        dia_raw = op['DIA']
+        municipio = op['MUNICIPIO']
+        data_municipio = op['DATA']
+        quantidade = int(op['QUANTIDADE'])
+        if quantidade <= 0:
+            continue
+
         data_municipio_dt = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
         if pd.isna(data_municipio_dt):
             continue
@@ -166,37 +165,32 @@ def processar_distribuicao(arquivo_excel):
         candidatos = candidatos[candidatos['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio)]
         candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
 
-        for _, op in grupo.iterrows():
-            categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
-            quantidade = int(op['QUANTIDADE'])
-            if quantidade <= 0:
+        categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
+        candidatos_op = candidatos[candidatos['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))]
+
+        data_key = data_municipio_dt.strftime("%Y-%m-%d")
+        convocados_na_data = datas_convocados.get(data_key, set())
+        candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
+        candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
+
+        # ------------------- Alocação balanceada -------------------
+        selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, contador_convocacoes, presidente_forcado=True)
+
+        for _, pessoa in selecionados.iterrows():
+            nome = pessoa['NOME']
+            if municipio in municipios_por_pessoa[nome]:
                 continue
-
-            candidatos_op = candidatos[candidatos['CATEGORIA'].apply(
-                lambda x: any(cat in str(x) for cat in categorias_necessarias))]
-            data_key = data_municipio_dt.strftime("%Y-%m-%d")
-            convocados_na_data = datas_convocados.get(data_key, set())
-            candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
-            candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
-
-            # ------------------- Alocação balanceada -------------------
-            selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, contador_convocacoes, presidente_forcado=True)
-
-            for _, pessoa in selecionados.iterrows():
-                nome = pessoa['NOME']
-                if municipio in municipios_por_pessoa[nome]:
-                    continue
-                distribuicoes.append({
-                    "DIA": dia_semana_pt,
-                    "DATA": data_str_pt,
-                    "MUNICIPIO": municipio,
-                    "NOME": nome,
-                    "CATEGORIA": pessoa['CATEGORIA'],
-                    "PRESIDENTE": "SIM" if nome == presidente_nome else "NAO"
-                })
-                contador_convocacoes[nome] += 1
-                datas_convocados.setdefault(data_key, set()).add(nome)
-                municipios_por_pessoa[nome].add(municipio)
+            distribuicoes.append({
+                "DIA": dia_semana_pt,
+                "DATA": data_str_pt,
+                "MUNICIPIO": municipio,
+                "NOME": nome,
+                "CATEGORIA": pessoa['CATEGORIA'],
+                "PRESIDENTE": "SIM" if nome == presidente_nome else "NAO"
+            })
+            contador_convocacoes[nome] += 1
+            datas_convocados.setdefault(data_key, set()).add(nome)
+            municipios_por_pessoa[nome].add(municipio)
 
     # ----------------------- Não convocados -----------------------
     nao_convocados_lista = []
@@ -291,7 +285,7 @@ st.markdown(page_bg, unsafe_allow_html=True)
 st.markdown("""
     <div class="main-card">
         <h1>📊 Distribuição Equilibrada de Convocações</h1>
-        <p>O sistema distribui as convocações da forma mais equilibrada possível, garantindo 1 presidente por município/dia, respeitando disponibilidade, categorias e municípios/dia/semana.</p>
+        <p>O sistema distribui as convocações da forma mais equilibrada possível, garantindo 1 presidente por município/dia/operação, respeitando disponibilidade, categorias e municípios/dia/semana.</p>
     </div>
     """, unsafe_allow_html=True)
 
