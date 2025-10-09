@@ -40,12 +40,10 @@ def normalizar_texto(txt):
 def esta_disponivel(row, data):
     inicio = row.get('INICIO_INDISPONIBILIDADE', pd.NaT)
     fim = row.get('FIM_INDISPONIBILIDADE', pd.NaT)
-
     if pd.notna(inicio):
         inicio = pd.to_datetime(inicio, dayfirst=True, errors='coerce')
     if pd.notna(fim):
         fim = pd.to_datetime(fim, dayfirst=True, errors='coerce')
-
     if pd.notna(inicio) and pd.notna(fim):
         if inicio <= data <= fim:
             return False
@@ -64,35 +62,47 @@ def traduzir_dia(data_item_dt):
     dia_semana = data_item_dt.strftime("%A").upper()
     return dias_traducao.get(dia_semana, dia_semana)
 
-def alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados):
+def alocar_operacao(candidatos_op, quantidade, presidente_forcado=False):
     if candidatos_op.empty:
         return pd.DataFrame(), None
 
-    candidatos_op = candidatos_op.sort_values('CONVOCACOES')
+    presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM']
+    nao_presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] != 'SIM']
 
-    presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'].str.upper() == 'SIM']
-    presidente_selecionado = None
+    selecionados = pd.DataFrame()
+    presidente_nome = None
 
-    if not presidentes_disponiveis.empty:
-        presidente_selecionado = presidentes_disponiveis.sample(1, random_state=random.randint(0, 10000))
-        restantes = candidatos_op[~candidatos_op['NOME'].isin(presidente_selecionado['NOME'])]
-        restantes = restantes.sample(min(len(restantes), max(0, quantidade - 1)), random_state=random.randint(0, 10000))
-        selecionados = pd.concat([presidente_selecionado, restantes])
+    # Escolhe um presidente
+    if not presidentes.empty:
+        presidente = presidentes.sample(1, random_state=random.randint(0, 10000))
+        presidente_nome = presidente.iloc[0]['NOME']
+        selecionados = presidente
+        restante = quantidade - 1
+        if restante > 0 and not nao_presidentes.empty:
+            adicionais = nao_presidentes.sample(min(restante, len(nao_presidentes)), random_state=random.randint(0, 10000))
+            selecionados = pd.concat([selecionados, adicionais])
     else:
-        selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
+        if presidente_forcado:
+            candidato = candidatos_op.sample(1, random_state=random.randint(0, 10000)).copy()
+            candidato['PRESIDENTE_DE_BANCA'] = 'SIM'
+            presidente_nome = candidato.iloc[0]['NOME']
+            selecionados = candidato
+            restante = quantidade - 1
+            if restante > 0:
+                adicionais = candidatos_op[~candidatos_op['NOME'].isin([presidente_nome])]
+                if not adicionais.empty:
+                    adicionais = adicionais.sample(min(restante, len(adicionais)), random_state=random.randint(0, 10000))
+                    selecionados = pd.concat([selecionados, adicionais])
+        else:
+            selecionados = candidatos_op.sample(min(quantidade, len(candidatos_op)), random_state=random.randint(0, 10000))
 
     if len(selecionados) > quantidade:
         selecionados = selecionados.sample(quantidade, random_state=random.randint(0, 10000))
 
-    presidente_nome = None
-    if presidente_selecionado is not None:
-        presidente_nome = presidente_selecionado.iloc[0]['NOME']
-        presidentes_ja_convocados.add(presidente_nome)
-
     return selecionados, presidente_nome
 
 # -----------------------
-# Processamento com regras avançadas
+# Processamento principal
 # -----------------------
 def processar_distribuicao(arquivo_excel):
     xls = pd.ExcelFile(arquivo_excel)
@@ -107,7 +117,7 @@ def processar_distribuicao(arquivo_excel):
             df['NOME'] = df[col]
             break
     if 'NOME' not in df.columns:
-        st.error("❌ Erro: coluna de nomes não encontrada")
+        st.error("❌ Coluna de nomes não encontrada")
         return None, pd.DataFrame(), pd.DataFrame(), io.BytesIO()
 
     for col in ['INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA', 'MUNICIPIO_ORIGEM']:
@@ -122,7 +132,6 @@ def processar_distribuicao(arquivo_excel):
 
     distribuicoes = []
     contador_convocacoes = {nome: 0 for nome in df['NOME'].unique()}
-    presidentes_ja_convocados = set()
     datas_convocados = {}
     municipios_por_pessoa = defaultdict(set)
 
@@ -130,80 +139,102 @@ def processar_distribuicao(arquivo_excel):
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
                         'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
-    rodadas = 0
-    max_rodadas = 15
     min_convocacoes = 3
 
-    while rodadas < max_rodadas:
-        rodadas += 1
-        alteracao = False
-        for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA', 'MUNICIPIO', 'DATA']):
-            data_municipio_dt = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
-            if pd.isna(data_municipio_dt):
+    # Loop principal de distribuição
+    for (dia_raw, municipio, data_municipio), grupo in dias_distribuicao.groupby(['DIA', 'MUNICIPIO', 'DATA']):
+        data_municipio_dt = pd.to_datetime(data_municipio, dayfirst=True, errors='coerce')
+        if pd.isna(data_municipio_dt):
+            continue
+        dia_semana_pt = traduzir_dia(data_municipio_dt)
+        data_str_pt = data_municipio_dt.strftime("%d/%m/%Y")
+
+        candidatos = candidatos_df.copy()
+        candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)]
+        candidatos = candidatos[candidatos['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio)]
+        candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
+
+        for _, op in grupo.iterrows():
+            categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
+            quantidade = int(op['QUANTIDADE'])
+            candidatos_op = candidatos[candidatos['CATEGORIA'].apply(lambda x: any(cat in str(x) for cat in categorias_necessarias))]
+
+            data_key = data_municipio_dt.strftime("%Y-%m-%d")
+            convocados_na_data = datas_convocados.get(data_key, set())
+            candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
+            candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
+
+            if candidatos_op.empty:
                 continue
-            dia_semana_pt = traduzir_dia(data_municipio_dt)
-            data_str_pt = data_municipio_dt.strftime("%d/%m/%Y")
 
-            candidatos = candidatos_df.copy()
-            candidatos = candidatos[candidatos.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)]
-            candidatos = candidatos[candidatos['MUNICIPIO_ORIGEM'].apply(normalizar_texto) != normalizar_texto(municipio)]
-            candidatos['CONVOCACOES'] = candidatos['NOME'].map(contador_convocacoes)
+            selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, presidente_forcado=True)
 
-            for _, op in grupo.iterrows():
-                categorias_necessarias = [cat.strip() for cat in str(op['CATEGORIA']).split(',')]
-                quantidade = int(op['QUANTIDADE'])
-                candidatos_op = candidatos[candidatos['CATEGORIA'].apply(
-                    lambda x: any(cat in str(x) for cat in categorias_necessarias))]
-
-                data_key = data_municipio_dt.strftime("%Y-%m-%d")
-                convocados_na_data = datas_convocados.get(data_key, set())
-                candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
-                candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
-
-                candidatos_op = candidatos_op.sort_values('CONVOCACOES', ascending=True)
-                if candidatos_op.empty:
+            for _, pessoa in selecionados.iterrows():
+                nome = pessoa['NOME']
+                if municipio in municipios_por_pessoa[nome]:
                     continue
+                distribuicoes.append({
+                    "DIA": dia_semana_pt,
+                    "DATA": data_str_pt,
+                    "MUNICIPIO": municipio,
+                    "NOME": nome,
+                    "CATEGORIA": pessoa['CATEGORIA'],
+                    "PRESIDENTE": "SIM" if nome == presidente_nome else "NAO"
+                })
+                contador_convocacoes[nome] += 1
+                datas_convocados.setdefault(data_key, set()).add(nome)
+                municipios_por_pessoa[nome].add(municipio)
 
-                selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, presidentes_ja_convocados)
+    # ----------------------- Garantir mínimo de 3 convocações (otimizado)
+    for nome, cont in contador_convocacoes.items():
+        faltam = min_convocacoes - cont
+        if faltam <= 0:
+            continue
 
-                # Garantir pelo menos 1 presidente se houver disponível
-                if not any(selecionados['PRESIDENTE_DE_BANCA'] == 'SIM'):
-                    presidentes_disponiveis = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM']
-                    presidentes_disponiveis = presidentes_disponiveis[~presidentes_disponiveis['NOME'].isin(selecionados['NOME'])]
-                    if not presidentes_disponiveis.empty:
-                        pres_subs = presidentes_disponiveis.sample(1, random_state=random.randint(0,10000)).iloc[0]
-                        for idx, row_sel in selecionados.iterrows():
-                            if row_sel['PRESIDENTE_DE_BANCA'] != 'SIM':
-                                selecionados.loc[idx] = pres_subs
-                                presidente_nome = pres_subs['NOME']
-                                break
+        datas_validas = dias_distribuicao['DATA'].dropna().unique()
+        datas_validas = [pd.to_datetime(d, dayfirst=True, errors='coerce') for d in datas_validas]
+        datas_validas = [d for d in datas_validas if not pd.isna(d)]
 
-                for _, pessoa in selecionados.iterrows():
-                    nome = pessoa['NOME']
-                    presidente = pessoa['PRESIDENTE_DE_BANCA'] == 'SIM'
+        for data_municipio_dt in datas_validas:
+            if faltam == 0:
+                break
+            data_key = data_municipio_dt.strftime("%Y-%m-%d")
+            if nome in datas_convocados.get(data_key, set()):
+                continue
 
-                    if municipio in municipios_por_pessoa[nome]:
-                        continue
+            candidatos_op = candidatos_df[candidatos_df['NOME'] == nome]
+            candidatos_op = candidatos_op[candidatos_op.apply(lambda x: esta_disponivel(x, data_municipio_dt), axis=1)]
+            municipios_usados = municipios_por_pessoa[nome]
+            candidatos_op = candidatos_op[~candidatos_op['MUNICIPIO_ORIGEM'].apply(normalizar_texto).isin([normalizar_texto(m) for m in municipios_usados])]
+            if candidatos_op.empty:
+                continue
 
-                    if presidente or contador_convocacoes[nome] < min_convocacoes:
-                        distribuicoes.append({
-                            "DIA": dia_semana_pt,
-                            "DATA": data_str_pt,
-                            "MUNICIPIO": municipio,
-                            "NOME": nome,
-                            "CATEGORIA": pessoa['CATEGORIA'],
-                            "PRESIDENTE": "SIM" if nome == presidente_nome else "NAO"
-                        })
-                        contador_convocacoes[nome] += 1
-                        datas_convocados.setdefault(data_key, set()).add(nome)
-                        municipios_por_pessoa[nome].add(municipio)
-                        alteracao = True
+            pessoa = candidatos_op.iloc[0]
 
-        if all(v >= min_convocacoes or df.loc[df['NOME'] == n, 'PRESIDENTE_DE_BANCA'].iloc[0] == 'SIM'
-               for n, v in contador_convocacoes.items()):
-            break
-        if not alteracao:
-            break
+            municipio_livre = None
+            for _, row_dist in dias_distribuicao.iterrows():
+                data_dist = pd.to_datetime(row_dist['DATA'], dayfirst=True, errors='coerce')
+                if data_dist != data_municipio_dt:
+                    continue
+                municipio_cand = row_dist['MUNICIPIO']
+                if municipio_cand not in municipios_por_pessoa[nome]:
+                    municipio_livre = municipio_cand
+                    break
+            if municipio_livre is None:
+                continue
+
+            distribuicoes.append({
+                "DIA": traduzir_dia(data_municipio_dt),
+                "DATA": data_municipio_dt.strftime("%d/%m/%Y"),
+                "MUNICIPIO": municipio_livre,
+                "NOME": nome,
+                "CATEGORIA": pessoa['CATEGORIA'],
+                "PRESIDENTE": "SIM" if pessoa['PRESIDENTE_DE_BANCA'] == 'SIM' else "NAO"
+            })
+            contador_convocacoes[nome] += 1
+            datas_convocados.setdefault(data_key, set()).add(nome)
+            municipios_por_pessoa[nome].add(municipio_livre)
+            faltam -= 1
 
     # ----------------------- Não convocados
     nao_convocados_lista = []
@@ -228,38 +259,6 @@ def processar_distribuicao(arquivo_excel):
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA", "CATEGORIA"])
     df_convocados = pd.DataFrame(distribuicoes)
 
-    # ----------------------- Garantir presidente de banca (último caso)
-    correcao_ultimocaso = []
-
-    for (dia, municipio), grupo in df_convocados.groupby(['DIA', 'MUNICIPIO']):
-        if not any(grupo['PRESIDENTE'] == 'SIM'):
-            candidatos_pres = df_nao_convocados[
-                (df_nao_convocados['MUNICIPIO_ORIGEM'] != municipio) &
-                (df_nao_convocados['PRESIDENTE_DE_BANCA'] == 'SIM')
-            ]
-            if not candidatos_pres.empty:
-                pres_subs = candidatos_pres.sample(1, random_state=random.randint(0, 10000)).iloc[0]
-                df_convocados = pd.concat([
-                    df_convocados,
-                    pd.DataFrame([{
-                        "DIA": dia,
-                        "DATA": pres_subs['DATA'],
-                        "MUNICIPIO": municipio,
-                        "NOME": pres_subs['NOME'],
-                        "CATEGORIA": pres_subs['CATEGORIA'],
-                        "PRESIDENTE": "SIM"
-                    }])
-                ], ignore_index=True)
-                df_nao_convocados = df_nao_convocados[df_nao_convocados['NOME'] != pres_subs['NOME']]
-                correcao_ultimocaso.append({
-                    "DIA": dia,
-                    "MUNICIPIO": municipio,
-                    "NOME": pres_subs['NOME'],
-                    "CATEGORIA": pres_subs['CATEGORIA']
-                })
-
-    df_correcao_ultimocaso = pd.DataFrame(correcao_ultimocaso)
-
     # ----------------------- Exportação Excel
     wb = Workbook()
     ws1 = wb.active
@@ -272,12 +271,6 @@ def processar_distribuicao(arquivo_excel):
     for r_idx, row in enumerate(dataframe_to_rows(df_nao_convocados, index=False, header=True), 1):
         for c_idx, value in enumerate(row, 1):
             ws2.cell(row=r_idx, column=c_idx, value=value)
-
-    if not df_correcao_ultimocaso.empty:
-        ws3 = wb.create_sheet("Correcoes Ultimo Caso")
-        for r_idx, row in enumerate(dataframe_to_rows(df_correcao_ultimocaso, index=False, header=True), 1):
-            for c_idx, value in enumerate(row, 1):
-                ws3.cell(row=r_idx, column=c_idx, value=value)
 
     output = io.BytesIO()
     wb.save(output)
