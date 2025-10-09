@@ -58,55 +58,41 @@ def traduzir_dia(data_item_dt):
     dia_semana = data_item_dt.strftime("%A").upper()
     return dias_traducao.get(dia_semana, dia_semana)
 
-# ----------------------- Nova função de alocação balanceada -----------------------
+# ----------------------- Função de alocação balanceada -----------------------
 def alocar_operacao(candidatos_op, quantidade, contador_convocacoes, presidente_forcado=False):
-    """
-    Seleciona exatamente a quantidade necessária, garantindo 1 presidente por operação
-    e distribuindo de forma equilibrada matematicamente.
-    """
     if candidatos_op.empty:
         return pd.DataFrame(), None
 
     candidatos_op = candidatos_op.copy()
     candidatos_op['CONVOCACOES'] = candidatos_op['NOME'].map(contador_convocacoes)
     
-    # Separar presidentes e não presidentes
     presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] == 'SIM'].sort_values('CONVOCACOES')
     nao_presidentes = candidatos_op[candidatos_op['PRESIDENTE_DE_BANCA'] != 'SIM'].sort_values('CONVOCACOES')
 
     selecionados = pd.DataFrame()
     presidente_nome = None
 
-    # Escolher 1 presidente
     if not presidentes.empty:
         presidente = presidentes.head(1)
         presidente_nome = presidente.iloc[0]['NOME']
         selecionados = presidente
     elif presidente_forcado:
-        # Se não houver presidente disponível, escolher alguém e forçar
         candidato = candidatos_op.head(1)
         presidente_nome = candidato.iloc[0]['NOME']
         candidato.loc[:, 'PRESIDENTE_DE_BANCA'] = 'SIM'
         selecionados = candidato
 
-    # Determinar quantos adicionais são necessários
     restantes = quantidade - len(selecionados)
 
     if restantes > 0:
-        # Filtrar candidatos restantes, sem repetir o presidente
         candidatos_restantes = candidatos_op[~candidatos_op['NOME'].isin([presidente_nome])]
         candidatos_restantes = candidatos_restantes.sort_values('CONVOCACOES')
-        
-        # Se não houver candidatos suficientes, permitir repetição balanceada
         while len(candidatos_restantes) < restantes:
             candidatos_restantes = pd.concat([candidatos_restantes, candidatos_restantes])
-
         adicionais = candidatos_restantes.head(restantes)
         selecionados = pd.concat([selecionados, adicionais])
 
-    # Garantir aleatoriedade sem perder equilíbrio
     selecionados = selecionados.sample(frac=1, random_state=random.randint(0, 10000)).reset_index(drop=True)
-
     return selecionados, presidente_nome
 
 # ----------------------- Processamento principal -----------------------
@@ -136,6 +122,7 @@ def processar_distribuicao(arquivo_excel):
         else:
             df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
 
+    # ---------------- Inicializa variáveis para cada processamento ----------------
     distribuicoes = []
     contador_convocacoes = {nome: 0 for nome in df['NOME'].unique()}
     datas_convocados = {}
@@ -145,7 +132,6 @@ def processar_distribuicao(arquivo_excel):
     candidatos_df = df[['NOME', 'CATEGORIA', 'INDISPONIBILIDADE', 'PRESIDENTE_DE_BANCA',
                         'MUNICIPIO_ORIGEM', 'INICIO_INDISPONIBILIDADE', 'FIM_INDISPONIBILIDADE']].dropna(subset=['NOME'])
 
-    # ---------------- Loop principal ----------------
     for _, op in dias_distribuicao.iterrows():
         dia_raw = op['DIA']
         municipio = op['MUNICIPIO']
@@ -173,7 +159,6 @@ def processar_distribuicao(arquivo_excel):
         candidatos_op = candidatos_op[~candidatos_op['NOME'].isin(convocados_na_data)]
         candidatos_op = candidatos_op[~candidatos_op['NOME'].isin([n for n in municipios_por_pessoa if municipio in municipios_por_pessoa[n]])]
 
-        # ------------------- Alocação balanceada -------------------
         selecionados, presidente_nome = alocar_operacao(candidatos_op, quantidade, contador_convocacoes, presidente_forcado=True)
 
         for _, pessoa in selecionados.iterrows():
@@ -192,7 +177,6 @@ def processar_distribuicao(arquivo_excel):
             datas_convocados.setdefault(data_key, set()).add(nome)
             municipios_por_pessoa[nome].add(municipio)
 
-    # ----------------------- Não convocados -----------------------
     nao_convocados_lista = []
     for _, row in candidatos_df.iterrows():
         datas_validas = [d for d in dias_distribuicao['DATA'].dropna().unique()
@@ -214,18 +198,24 @@ def processar_distribuicao(arquivo_excel):
     df_nao_convocados = pd.DataFrame(nao_convocados_lista).drop_duplicates(subset=["NOME", "DIA", "CATEGORIA"])
     df_convocados = pd.DataFrame(distribuicoes)
 
-    # ----------------------- Exportação Excel -----------------------
+    # ----------------------- Exportação Excel Ajustada -----------------------
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
-    for r_idx, row in enumerate(dataframe_to_rows(df_convocados, index=False, header=True), 1):
-        for c_idx, value in enumerate(row, 1):
-            ws1.cell(row=r_idx, column=c_idx, value=value)
+    if not df_convocados.empty:
+        for r_idx, row in enumerate(dataframe_to_rows(df_convocados, index=False, header=True), 1):
+            for c_idx, value in enumerate(row, 1):
+                ws1.cell(row=r_idx, column=c_idx, value=value)
+    else:
+        ws1.append(["Sem convocados para esta planilha"])
 
     ws2 = wb.create_sheet("Nao Convocados")
-    for r_idx, row in enumerate(dataframe_to_rows(df_nao_convocados, index=False, header=True), 1):
-        for c_idx, value in enumerate(row, 1):
-            ws2.cell(row=r_idx, column=c_idx, value=value)
+    if not df_nao_convocados.empty:
+        for r_idx, row in enumerate(dataframe_to_rows(df_nao_convocados, index=False, header=True), 1):
+            for c_idx, value in enumerate(row, 1):
+                ws2.cell(row=r_idx, column=c_idx, value=value)
+    else:
+        ws2.append(["Todos foram convocados"])
 
     output = io.BytesIO()
     wb.save(output)
@@ -299,7 +289,7 @@ if arquivo:
         with st.spinner("Processando..."):
             nome_saida, df_convocados, df_nao_convocados, arquivo_excel = processar_distribuicao(arquivo)
 
-        if df_convocados.empty and df_nao_convocados.empty:
+        if (df_convocados.empty and df_nao_convocados.empty) or arquivo_excel is None:
             st.error("⚠️ Não foi possível gerar a distribuição. Verifique a planilha enviada.")
         else:
             st.success("✅ Distribuição gerada com sucesso!")
@@ -312,6 +302,7 @@ if arquivo:
                 st.markdown("### 🚫 Não Convocados")
                 st.dataframe(df_nao_convocados, use_container_width=True)
 
+            arquivo_excel.seek(0)  # garante que sempre lê do início
             b64 = base64.b64encode(arquivo_excel.read()).decode()
             st.markdown(f"""
                 <div style="text-align:center; margin-top:30px;">
@@ -323,3 +314,6 @@ if arquivo:
                     </a>
                 </div>
             """, unsafe_allow_html=True)
+
+
+
