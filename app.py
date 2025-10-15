@@ -8,11 +8,14 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
 import unicodedata
 
-# ----------------------- Configuração de locale -----------------------
+# ----------------------- Configuração de locale segura -----------------------
 try:
-    locale.setlocale(locale.LC_TIME, "pt_BR.utf8")
-except:
-    locale.setlocale(locale.LC_TIME, "Portuguese_Brazil.1252")
+    locale.setlocale(locale.LC_TIME, "pt_BR.UTF-8")  # Linux / Mac
+except locale.Error:
+    try:
+        locale.setlocale(locale.LC_TIME, "pt_BR")    # fallback
+    except locale.Error:
+        locale.setlocale(locale.LC_TIME, "")         # padrão do sistema
 
 # ----------------------- Função para normalizar colunas -----------------------
 def normalizar_colunas(df):
@@ -66,8 +69,6 @@ def processar_distribuicao(arquivo):
 
     df["DATA"].fillna(method="ffill", inplace=True)
     df["DIA"].fillna(method="ffill", inplace=True)
-
-    # Tratar QUANTIDADE
     df["QUANTIDADE"] = df["QUANTIDADE"].fillna(0).astype(int)
 
     operacoes = df.groupby(["DIA", "DATA", "MUNICIPIO", "CATEGORIA", "QUANTIDADE"], dropna=False)
@@ -78,7 +79,7 @@ def processar_distribuicao(arquivo):
     convocados = []
     nao_convocados = []
 
-    # Função para verificar compatibilidade de categorias
+    # ----------------------- Função para compatibilidade de categorias -----------------------
     def possui_duas_categorias(categorias_pessoa, categorias_operacao):
         lista_pessoa = [x.strip() for x in categorias_pessoa.split(",")]
         lista_operacao = [x.strip() for x in categorias_operacao.split(",")]
@@ -91,7 +92,6 @@ def processar_distribuicao(arquivo):
         # ------------------ Regra 1: Não convocar mais de uma vez por dia ------------------
         nomes_convocados_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
         subset = subset[~subset["NOME"].isin(nomes_convocados_no_dia)]
-        # -----------------------------------------------------------------------------------
 
         # Respeitar indisponibilidade (Regra 4)
         subset = subset[~(
@@ -116,10 +116,10 @@ def processar_distribuicao(arquivo):
                 })
             continue
 
-        # Compatibilidade mínima de categorias (Regra 3)
+        # Compatibilidade mínima de categorias (duas categorias) - Regra 3
         subset = subset[subset["CATEGORIA"].apply(lambda c: possui_duas_categorias(c, categoria_oper))]
 
-        # ------------------ Regra 9: Poá sexta-feira ------------------
+        # ------------------ Poá sexta-feira ------------------
         if municipio == "POA" and dia.upper() == "SEXTA" and qtd == 3:
             ops = categoria_oper.split(",")
             for op in ops:
@@ -170,9 +170,8 @@ def processar_distribuicao(arquivo):
                         "PRESIDENTE": "NÃO"
                     })
             continue
-        # -----------------------------------------------------------------------------------
 
-        # ------------------ Seleção presidente padrão (Regra 2) ------------------
+        # ------------------ Seleção presidente padrão ------------------
         candidatos_pres = subset[subset["PRESIDENTE_DE_BANCA"].str.upper() == "SIM"]
         presidente = None
         if not candidatos_pres.empty:
@@ -198,7 +197,7 @@ def processar_distribuicao(arquivo):
             "PRESIDENTE": "SIM"
         })
 
-        # Seleção dos demais convocados (Regra 7 e 8)
+        # ------------------ Seleção dos demais convocados ------------------
         subset = subset[subset["NOME"] != presidente["NOME"]].copy()
         subset["CONV_COUNT"] = subset["NOME"].map(lambda x: contagem_convocacoes.get(x, 0))
         subset = subset.sort_values(by="CONV_COUNT")
@@ -227,7 +226,7 @@ def processar_distribuicao(arquivo):
                 "PRESIDENTE": "NÃO"
             })
 
-        # Garantir número exato de convocados (Regra 6)
+        # Garantir número exato de convocados
         total_previsto = int(qtd)
         convocados_no_dia_mun = [c for c in convocados if c["DATA"] == data.date() and c["MUNICIPIO"] == municipio]
         total_atual = len(convocados_no_dia_mun)
@@ -252,7 +251,7 @@ def processar_distribuicao(arquivo):
             for _ in range(excedente):
                 convocados.pop()
 
-        # Não convocados restantes (Regra 10)
+        # Não convocados restantes
         nomes_ja_nao_convocados = [x["NOME"] for x in nao_convocados if x["DATA"] == data.date()]
         disponiveis_no_dia = df[(df["MUNICIPIO_ORIGEM"] != municipio)
                                 & (df["CATEGORIA"].apply(lambda c: possui_duas_categorias(c, categoria_oper)))]
@@ -268,7 +267,7 @@ def processar_distribuicao(arquivo):
                     "DATA": data.date()
                 })
 
-    # DataFrames finais
+    # ----------------------- DataFrames finais -----------------------
     df_convocados = pd.DataFrame(convocados).drop_duplicates()
     df_nao_convocados = pd.DataFrame(nao_convocados).drop_duplicates(subset=["NOME", "DIA", "CATEGORIA"])
 
