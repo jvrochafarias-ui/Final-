@@ -81,12 +81,12 @@ def processar_distribuicao(arquivo):
 
     contagem_convocacoes = {nome: 0 for nome in df["NOME"].unique()}
     contagem_presidente = {nome: 0 for nome in df["NOME"].unique()}
-
     convocados = []
     nao_convocados = []
 
-    def obter_candidatos_eligiveis(df_total, nomes_convocados_no_dia, municipio, data, categoria_oper):
+    def obter_candidatos_eligiveis(df_total, nomes_convocados_no_dia, municipio, data, categoria_oper, convocados_semana):
         candidatos = df_total[~df_total["NOME"].isin(nomes_convocados_no_dia)].copy()
+
         if "INICIO_INDISPONIBILIDADE" in candidatos.columns and "FIM_INDISPONIBILIDADE" in candidatos.columns:
             candidatos = candidatos[~(
                 (candidatos["INICIO_INDISPONIBILIDADE"].notna())
@@ -94,19 +94,31 @@ def processar_distribuicao(arquivo):
                 & (candidatos["INICIO_INDISPONIBILIDADE"] <= data)
                 & (candidatos["FIM_INDISPONIBILIDADE"] >= data)
             )]
+
         candidatos = candidatos[candidatos["MUNICIPIO_ORIGEM"] != municipio]
+
+        semana = data.isocalendar()[1]
+        ja_convocados_semana = [c for c in convocados_semana
+                                if c["MUNICIPIO"]==municipio
+                                and c["SEMANA"]==semana
+                                and c["PRESIDENTE"]=="NÃO"]
+        nomes_excluir = [c["NOME"] for c in ja_convocados_semana]
+        candidatos = candidatos[~((candidatos["NOME"].isin(nomes_excluir)) & (candidatos["PRESIDENTE_DE_BANCA"].str.upper()!="SIM"))]
+
         candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
         candidatos = candidatos[candidatos["MATCH_COUNT"] >= 2]
         return candidatos
 
+    # --- Processamento das operações ---
     for (dia, data, municipio, categoria_oper, qtd), _ in operacoes:
-        subset = df.copy()
         nomes_convocados_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
+        for c in convocados:
+            c["SEMANA"] = c["DATA"].isocalendar()[1]
 
-        pool = obter_candidatos_eligiveis(df, nomes_convocados_no_dia, municipio, data, categoria_oper)
+        pool = obter_candidatos_eligiveis(df, nomes_convocados_no_dia, municipio, data, categoria_oper, convocados)
 
         if int(qtd) == 0 or pool.empty:
-            for _, row in subset.iterrows():
+            for _, row in df.iterrows():
                 if row["NOME"] not in nomes_convocados_no_dia:
                     nao_convocados.append({
                         "NOME": row["NOME"],
@@ -118,11 +130,11 @@ def processar_distribuicao(arquivo):
                     })
             continue
 
-        # ----------------------- Regras especiais POÁ e Santo André sexta-feira -----------------------
+        # ----------------------- Regras especiais POÁ/Santo André sexta-feira -----------------------
         regra_especial = False
         if (municipio == "POA" and dia.upper() == "SEXTA" and int(qtd) == 3):
             regra_especial = True
-        if (municipio == "SANTO ANDRE" and dia.upper() == "TERÇA" and int(qtd) in [4,3,3]):
+        if (municipio == "SANTO ANDRE" and dia.upper() == "SEXTA"):
             regra_especial = True
 
         if regra_especial:
@@ -134,10 +146,10 @@ def processar_distribuicao(arquivo):
                 if not candidatos_pres.empty:
                     presidente_nome = sorted(candidatos_pres["NOME"].unique(), key=lambda n: contagem_presidente[n])[0]
                     presidente = candidatos_pres[candidatos_pres["NOME"]==presidente_nome].iloc[0]
-                if presidente is None:
+                if presidente is None and not subset_op.empty:
                     possiveis = sorted(subset_op["NOME"].unique(), key=lambda n: contagem_presidente[n])
-                    if possiveis:
-                        presidente = subset_op[subset_op["NOME"]==possiveis[0]].iloc[0]
+                    presidente = subset_op[subset_op["NOME"]==possiveis[0]].iloc[0]
+
                 if presidente is None:
                     continue
 
@@ -203,7 +215,11 @@ def processar_distribuicao(arquivo):
         semana_atual = data.isocalendar()[1]
         for _, row_sel in pool_rest.iterrows():
             nome = row_sel["NOME"]
-            ja_convocado_mesmo_mun = any(c["NOME"]==nome and c["MUNICIPIO"]==municipio and datetime.strptime(str(c["DATA"]),"%Y-%m-%d").isocalendar()[1]==semana_atual for c in convocados)
+            ja_convocado_mesmo_mun = any(
+                c["NOME"]==nome and c["MUNICIPIO"]==municipio and c["PRESIDENTE"]=="NÃO"
+                and c["DATA"].isocalendar()[1]==semana_atual
+                for c in convocados
+            )
             if ja_convocado_mesmo_mun:
                 continue
             if contagem_convocacoes[nome]<3 or len(selecionados)<(int(qtd)-1):
@@ -222,50 +238,11 @@ def processar_distribuicao(arquivo):
                 "PRESIDENTE": "NÃO"
             })
 
-        # ----------------------- Garantir quantidade exata -----------------------
-        total_previsto = int(qtd)
-        convocados_no_dia_mun = [c for c in convocados if c["DATA"]==data.date() and c["MUNICIPIO"]==municipio]
-        total_atual = len(convocados_no_dia_mun)
-        if total_atual<total_previsto:
-            faltam = total_previsto - total_atual
-            pool_extra = pool_rest[~pool_rest["NOME"].isin([c["NOME"] for c in convocados_no_dia_mun])].copy()
-            pool_extra = pool_extra.sort_values(by="CONV_COUNT")
-            for _, row_sel in pool_extra.head(faltam).iterrows():
-                convocados.append({
-                    "DIA": dia,
-                    "DATA": data.date(),
-                    "MUNICIPIO": municipio,
-                    "NOME": row_sel["NOME"],
-                    "CATEGORIA": row_sel["CATEGORIA"],
-                    "PRESIDENTE": "NÃO"
-                })
-                contagem_convocacoes[row_sel["NOME"]] += 1
-        elif total_atual>total_previsto:
-            excedente = total_atual-total_previsto
-            for _ in range(excedente):
-                convocados.pop()
-
-        # ----------------------- Atualiza não convocados -----------------------
-        nomes_ja_nao_convocados = [x["NOME"] for x in nao_convocados if x["DATA"]==data.date()]
-        disponiveis_no_dia = df[(df["MUNICIPIO_ORIGEM"] != municipio)]
-        nomes_convocados = [c["NOME"] for c in convocados if c["DATA"]==data.date()]
-        for _, row_nc in disponiveis_no_dia.iterrows():
-            if row_nc["NOME"] not in nomes_convocados and row_nc["NOME"] not in nomes_ja_nao_convocados:
-                if matching_count(row_nc["CATEGORIA"], categoria_oper)>=2:
-                    nao_convocados.append({
-                        "NOME": row_nc["NOME"],
-                        "DIA": dia,
-                        "CATEGORIA": row_nc["CATEGORIA"],
-                        "MUNICIPIO_ORIGEM": row_nc["MUNICIPIO_ORIGEM"],
-                        "PRESIDENTE_DE_BANCA": row_nc.get("PRESIDENTE_DE_BANCA",""),
-                        "DATA": data.date()
-                    })
-
     # ----------------------- DataFrames finais -----------------------
     df_convocados = pd.DataFrame(convocados).drop_duplicates()
     df_nao_convocados = pd.DataFrame(nao_convocados).drop_duplicates(subset=["NOME","DIA","CATEGORIA"])
 
-    # Exportação
+    # ----------------------- Exportação Excel -----------------------
     nome_saida = "Distribuicao_Convocacoes.xlsx"
     wb = Workbook()
     ws1 = wb.active
@@ -280,7 +257,7 @@ def processar_distribuicao(arquivo):
     buffer.seek(0)
     return nome_saida, df_convocados, df_nao_convocados, buffer
 
-# ----------------------- Interface Streamlit -----------------------
+# ----------------------- Interface Streamlit Estilizada -----------------------
 st.set_page_config(page_title="Distribuição Equilibrada", page_icon="📊", layout="centered")
 
 page_bg = """
