@@ -59,18 +59,32 @@ def matching_count(categorias_pessoa, categorias_operacao):
     return sum(1 for c in oper if c in pessoa)
 
 # ==============================
-# 🚫 Verificação absoluta de indisponibilidade
+# 🚫 Verificações de indisponibilidade
 # ==============================
 dias_map = {"SEGUNDA":0, "TERCA":1, "QUARTA":2, "QUINTA":3,
             "SEXTA":4, "SABADO":5, "DOMINGO":6}
 
 def esta_indisponivel_fixa(nome, dias_indisponiveis, data):
-    """Retorna True se a pessoa não pode ser convocada no dia."""
+    """Retorna True se a pessoa não pode ser convocada no dia fixo."""
     if pd.isna(dias_indisponiveis) or dias_indisponiveis.strip() == "":
         return False
     dias = [d.strip().upper().replace("Ç","C").replace("Á","A") for d in dias_indisponiveis.split(",")]
     dias_num = [dias_map[d] for d in dias if d in dias_map]
     return data.weekday() in dias_num
+
+
+def esta_em_ferias(inicio, fim, data):
+    """Retorna True se a data estiver dentro do período de férias."""
+    if pd.isna(inicio) or pd.isna(fim):
+        return False
+    try:
+        inicio = pd.to_datetime(inicio, errors="coerce")
+        fim = pd.to_datetime(fim, errors="coerce")
+        if pd.isna(inicio) or pd.isna(fim):
+            return False
+        return inicio.date() <= data.date() <= fim.date()
+    except Exception:
+        return False
 
 # ==============================
 # 🧠 Processamento principal
@@ -104,9 +118,13 @@ def processar_distribuicao(arquivo):
         # Candidatos de outros municípios
         candidatos = df[df["MUNICIPIO_ORIGEM"] != municipio].copy().reset_index(drop=True)
 
-        # ✅ Aplicar regra absoluta de indisponibilidade por dia
+        # ✅ Aplicar regras de indisponibilidade (fixa e por férias)
         candidatos = candidatos.loc[~candidatos.apply(
-            lambda r: esta_indisponivel_fixa(r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), data.date()), axis=1
+            lambda r: (
+                esta_indisponivel_fixa(r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), data)
+                or esta_em_ferias(r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data)
+            ),
+            axis=1
         )].reset_index(drop=True)
 
         if candidatos.empty:
@@ -241,7 +259,7 @@ font-size:1rem; font-weight:bold; transition:0.3s;}
 st.markdown("""
 <div class="main-card">
 <h1>⚖️ Distribuição Equilibrada de Convocações</h1>
-<p>O sistema aplica todas as regras de convocação, respeitando indisponibilidades absolutas de dias, limite de convocações, compatibilidade mínima de categorias e equilíbrio semanal.</p>
+<p>O sistema aplica todas as regras de convocação, respeitando indisponibilidades absolutas de dias, períodos de férias, limite de convocações, compatibilidade mínima de categorias e equilíbrio semanal.</p>
 </div>
 """, unsafe_allow_html=True)
 
