@@ -8,7 +8,9 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
 import unicodedata
 
-# ----------------------- Configuração de locale segura -----------------------
+# ==============================
+# ⚙️ Configuração de locale
+# ==============================
 try:
     locale.setlocale(locale.LC_TIME, "pt_BR.UTF-8")
 except locale.Error:
@@ -17,57 +19,65 @@ except locale.Error:
     except locale.Error:
         locale.setlocale(locale.LC_TIME, "")
 
-# ----------------------- Função para normalizar colunas -----------------------
+# ==============================
+# 🔤 Normalização de colunas
+# ==============================
 def normalizar_colunas(df):
     def remover_acentos(s):
         if isinstance(s, str):
-            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+            return ''.join(c for c in unicodedata.normalize('NFD', s)
+                           if unicodedata.category(c) != 'Mn')
         return s
 
     df.columns = [remover_acentos(col).strip().upper() for col in df.columns]
 
-    col_renomear = {
+    renomear = {
         "MUNICIPIO ORIGEM": "MUNICIPIO_ORIGEM",
         "PRESIDENTE DE BANCA": "PRESIDENTE_DE_BANCA",
         "INICIO INDISPONIBILIDADE": "INICIO_INDISPONIBILIDADE",
-        "FIM INDISPONIBILIDADE": "FIM_INDISPONIBILIDADE"
+        "FIM INDISPONIBILIDADE": "FIM_INDISPONIBILIDADE",
+        "DIAS INDISPONIBILIDADE": "DIAS_INDISPONIBILIDADE"
     }
-    for antiga, nova in col_renomear.items():
+    for antiga, nova in renomear.items():
         if antiga in df.columns:
             df.rename(columns={antiga: nova}, inplace=True)
 
-    def limpar_texto(s):
-        if isinstance(s, str):
-            s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-            s = s.strip().upper()
-            return s
-        return s
-
-    if "MUNICIPIO" in df.columns:
-        df["MUNICIPIO"] = df["MUNICIPIO"].apply(limpar_texto)
-    if "MUNICIPIO_ORIGEM" in df.columns:
-        df["MUNICIPIO_ORIGEM"] = df["MUNICIPIO_ORIGEM"].apply(limpar_texto)
+    for col in ["MUNICIPIO", "MUNICIPIO_ORIGEM", "CATEGORIA", "NOME"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).apply(lambda s: remover_acentos(s).strip().upper())
 
     return df
 
-# ----------------------- Função para contar categorias compatíveis -----------------------
+# ==============================
+# 🔍 Contagem de categorias compatíveis
+# ==============================
 def matching_count(categorias_pessoa, categorias_operacao):
     if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
         return 0
-    lista_pessoa = [x.strip().upper() for x in categorias_pessoa.split(",") if x.strip()]
-    lista_oper = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
-    return sum(1 for cat in lista_oper if cat in lista_pessoa)
+    pessoa = [x.strip().upper() for x in categorias_pessoa.split(",") if x.strip()]
+    oper = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
+    return sum(1 for c in oper if c in pessoa)
 
-# ----------------------- Função principal de processamento -----------------------
+# ==============================
+# 🚫 Verificação absoluta de indisponibilidade
+# ==============================
+dias_map = {"SEGUNDA":0, "TERCA":1, "QUARTA":2, "QUINTA":3,
+            "SEXTA":4, "SABADO":5, "DOMINGO":6}
+
+def esta_indisponivel_fixa(nome, dias_indisponiveis, data):
+    """Retorna True se a pessoa não pode ser convocada no dia."""
+    if pd.isna(dias_indisponiveis) or dias_indisponiveis.strip() == "":
+        return False
+    dias = [d.strip().upper().replace("Ç","C").replace("Á","A") for d in dias_indisponiveis.split(",")]
+    dias_num = [dias_map[d] for d in dias if d in dias_map]
+    return data.weekday() in dias_num
+
+# ==============================
+# 🧠 Processamento principal
+# ==============================
 def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
     df = normalizar_colunas(df)
-
-    col_obrigatorias = ["NOME", "DIA", "DATA", "MUNICIPIO", "CATEGORIA", "QUANTIDADE",
-                        "MUNICIPIO_ORIGEM", "PRESIDENTE_DE_BANCA"]
-    col_faltando = [c for c in col_obrigatorias if c not in df.columns]
-    if col_faltando:
-        raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(col_faltando)}")
 
     for col in ["DATA", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]:
         if col in df.columns:
@@ -75,238 +85,192 @@ def processar_distribuicao(arquivo):
 
     df["DATA"].fillna(method="ffill", inplace=True)
     df["DIA"].fillna(method="ffill", inplace=True)
+    if "QUANTIDADE" not in df.columns:
+        df["QUANTIDADE"] = 1
     df["QUANTIDADE"] = df["QUANTIDADE"].fillna(0).astype(int)
 
-    operacoes = df.groupby(["DIA", "DATA", "MUNICIPIO", "CATEGORIA", "QUANTIDADE"], dropna=False)
+    cont_conv = {n:0 for n in df["NOME"].unique()}
+    cont_pres = {n:0 for n in df["NOME"].unique()}
+    convocados, nao_conv = [], []
 
-    contagem_convocacoes = {nome: 0 for nome in df["NOME"].unique()}
-    contagem_presidente = {nome: 0 for nome in df["NOME"].unique()}
-    convocados = []
-    nao_convocados = []
+    # Agrupar por operação
+    operacoes = df.groupby(["DIA","DATA","MUNICIPIO","CATEGORIA","QUANTIDADE"], dropna=False)
 
-    def obter_candidatos_eligiveis(df_total, nomes_convocados_no_dia, municipio, data, categoria_oper, convocados_semana):
-        candidatos = df_total[~df_total["NOME"].isin(nomes_convocados_no_dia)].copy()
-
-        if "INICIO_INDISPONIBILIDADE" in candidatos.columns and "FIM_INDISPONIBILIDADE" in candidatos.columns:
-            candidatos = candidatos[~(
-                (candidatos["INICIO_INDISPONIBILIDADE"].notna())
-                & (candidatos["FIM_INDISPONIBILIDADE"].notna())
-                & (candidatos["INICIO_INDISPONIBILIDADE"] <= data)
-                & (candidatos["FIM_INDISPONIBILIDADE"] >= data)
-            )]
-
-        candidatos = candidatos[candidatos["MUNICIPIO_ORIGEM"] != municipio]
-
-        semana = data.isocalendar()[1]
-        ja_convocados_semana = [c for c in convocados_semana
-                                if c["MUNICIPIO"]==municipio
-                                and c["SEMANA"]==semana
-                                and c["PRESIDENTE"]=="NÃO"]
-        nomes_excluir = [c["NOME"] for c in ja_convocados_semana]
-        candidatos = candidatos[~((candidatos["NOME"].isin(nomes_excluir)) & (candidatos["PRESIDENTE_DE_BANCA"].str.upper()!="SIM"))]
-
-        candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
-        candidatos = candidatos[candidatos["MATCH_COUNT"] >= 2]
-        return candidatos
-
-    # --- Processamento das operações ---
     for (dia, data, municipio, categoria_oper, qtd), _ in operacoes:
-        nomes_convocados_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
-        for c in convocados:
-            c["SEMANA"] = c["DATA"].isocalendar()[1]
-
-        pool = obter_candidatos_eligiveis(df, nomes_convocados_no_dia, municipio, data, categoria_oper, convocados)
-
-        if int(qtd) == 0 or pool.empty:
-            for _, row in df.iterrows():
-                if row["NOME"] not in nomes_convocados_no_dia:
-                    nao_convocados.append({
-                        "NOME": row["NOME"],
-                        "DIA": dia,
-                        "CATEGORIA": row["CATEGORIA"],
-                        "MUNICIPIO_ORIGEM": row["MUNICIPIO_ORIGEM"],
-                        "PRESIDENTE_DE_BANCA": row.get("PRESIDENTE_DE_BANCA",""),
-                        "DATA": data.date()
-                    })
+        qtd = int(qtd)
+        if qtd <= 0:
             continue
 
-        # ----------------------- Regras especiais POÁ/Santo André sexta-feira -----------------------
-        regra_especial = False
-        if (municipio == "POA" and dia.upper() == "SEXTA" and int(qtd) == 3):
-            regra_especial = True
-        if (municipio == "SANTO ANDRE" and dia.upper() == "SEXTA"):
-            regra_especial = True
+        # Candidatos de outros municípios
+        candidatos = df[df["MUNICIPIO_ORIGEM"] != municipio].copy().reset_index(drop=True)
 
-        if regra_especial:
-            ops = [x.strip() for x in categoria_oper.split(",") if x.strip()]
-            for op in ops:
-                subset_op = pool[pool["CATEGORIA"].str.contains(op)]
-                candidatos_pres = subset_op[subset_op["PRESIDENTE_DE_BANCA"].str.upper()=="SIM"]
-                presidente = None
-                if not candidatos_pres.empty:
-                    presidente_nome = sorted(candidatos_pres["NOME"].unique(), key=lambda n: contagem_presidente[n])[0]
-                    presidente = candidatos_pres[candidatos_pres["NOME"]==presidente_nome].iloc[0]
-                if presidente is None and not subset_op.empty:
-                    possiveis = sorted(subset_op["NOME"].unique(), key=lambda n: contagem_presidente[n])
-                    presidente = subset_op[subset_op["NOME"]==possiveis[0]].iloc[0]
+        # ✅ Aplicar regra absoluta de indisponibilidade por dia
+        candidatos = candidatos.loc[~candidatos.apply(
+            lambda r: esta_indisponivel_fixa(r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), data.date()), axis=1
+        )].reset_index(drop=True)
 
-                if presidente is None:
-                    continue
-
-                contagem_convocacoes[presidente["NOME"]] += 1
-                contagem_presidente[presidente["NOME"]] += 1
-                convocados.append({
-                    "DIA": dia,
-                    "DATA": data.date(),
-                    "MUNICIPIO": municipio,
-                    "NOME": presidente["NOME"],
-                    "CATEGORIA": presidente["CATEGORIA"],
-                    "PRESIDENTE": "SIM"
-                })
-
-                subset_rest = subset_op[subset_op["NOME"] != presidente["NOME"]].copy()
-                subset_rest["CONV_COUNT"] = subset_rest["NOME"].map(lambda x: contagem_convocacoes.get(x,0))
-                subset_rest = subset_rest.sort_values(by="CONV_COUNT")
-                for _, row_sel in subset_rest.head(int(qtd)-1).iterrows():
-                    convocados.append({
-                        "DIA": dia,
-                        "DATA": data.date(),
-                        "MUNICIPIO": municipio,
-                        "NOME": row_sel["NOME"],
-                        "CATEGORIA": row_sel["CATEGORIA"],
-                        "PRESIDENTE": "NÃO"
-                    })
-                    contagem_convocacoes[row_sel["NOME"]] += 1
+        if candidatos.empty:
             continue
 
-        # ----------------------- Seleção do presidente padrão -----------------------
-        candidatos_pres_pool = pool[pool["PRESIDENTE_DE_BANCA"].astype(str).str.upper()=="SIM"]
-        presidente = None
-        if not candidatos_pres_pool.empty:
-            presidente_nome = sorted(candidatos_pres_pool["NOME"].unique(), key=lambda n: contagem_presidente.get(n,0))[0]
-            presidente = candidatos_pres_pool[candidatos_pres_pool["NOME"]==presidente_nome].iloc[0]
+        # Compatibilidade de categorias
+        candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
+
+        # ✅ Regra especial: se a operação precisa de apenas 1 categoria, aceitar quem tiver 1
+        if len(categoria_oper.split(",")) == 1:
+            candidatos_validos = candidatos[candidatos["MATCH_COUNT"] >= 1].reset_index(drop=True)
         else:
-            possiveis = sorted(pool["NOME"].unique(), key=lambda n: contagem_presidente.get(n,0))
-            for n in possiveis:
-                candidato_df = pool[pool["NOME"]==n]
-                if not candidato_df.empty:
-                    presidente = candidato_df.iloc[0]
-                    break
-        if presidente is None:
+            candidatos_validos = candidatos[candidatos["MATCH_COUNT"] >= 2].reset_index(drop=True)
+
+        if candidatos_validos.empty:
             continue
 
-        contagem_convocacoes[presidente["NOME"]] += 1
-        contagem_presidente[presidente["NOME"]] += 1
+        candidatos = candidatos_validos
+
+        # Seleção presidente
+        pres_cand = candidatos[candidatos["PRESIDENTE_DE_BANCA"].astype(str).str.upper() == "SIM"]
+        if not pres_cand.empty:
+            nome_pres = sorted(pres_cand["NOME"].unique(), key=lambda n: cont_pres[n])[0]
+            presidente = pres_cand[pres_cand["NOME"] == nome_pres].iloc[0]
+        else:
+            nome_pres = sorted(candidatos["NOME"].unique(), key=lambda n: cont_pres[n])[0]
+            presidente = candidatos[candidatos["NOME"] == nome_pres].iloc[0]
+
+        # ❌ Verifica se já foi convocado no mesmo dia
+        if any(c["NOME"] == presidente["NOME"] and c["DATA"] == data.date() for c in convocados):
+            candidatos_restantes = candidatos[candidatos["NOME"] != presidente["NOME"]].reset_index(drop=True)
+            if candidatos_restantes.empty:
+                continue
+            presidente = candidatos_restantes.iloc[0]
+
+        cont_conv[presidente["NOME"]] += 1
+        cont_pres[presidente["NOME"]] += 1
         convocados.append({
-            "DIA": dia,
-            "DATA": data.date(),
-            "MUNICIPIO": municipio,
-            "NOME": presidente["NOME"],
-            "CATEGORIA": presidente["CATEGORIA"],
+            "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
+            "NOME": presidente["NOME"], "CATEGORIA": presidente["CATEGORIA"],
             "PRESIDENTE": "SIM"
         })
 
-        # ----------------------- Seleção dos demais -----------------------
-        pool_rest = pool[pool["NOME"] != presidente["NOME"]].copy()
-        pool_rest["CONV_COUNT"] = pool_rest["NOME"].map(lambda x: contagem_convocacoes.get(x,0))
-        pool_rest = pool_rest.sort_values(by="CONV_COUNT")
+        # Auxiliares
+        pool_aux = candidatos[candidatos["NOME"] != presidente["NOME"]].copy()
+        pool_aux["CONV_COUNT"] = pool_aux["NOME"].map(cont_conv)
+        pool_aux = pool_aux.sort_values(by="CONV_COUNT").reset_index(drop=True)
 
         selecionados = []
-        semana_atual = data.isocalendar()[1]
-        for _, row_sel in pool_rest.iterrows():
-            nome = row_sel["NOME"]
-            ja_convocado_mesmo_mun = any(
-                c["NOME"]==nome and c["MUNICIPIO"]==municipio and c["PRESIDENTE"]=="NÃO"
-                and c["DATA"].isocalendar()[1]==semana_atual
+        semana = data.isocalendar()[1]
+        for _, r in pool_aux.iterrows():
+            nome = r["NOME"]
+            # ❌ Verifica se já foi convocado no mesmo dia
+            if any(c["NOME"]==nome and c["DATA"]==data.date() for c in convocados):
+                continue
+            ja_mesmo_mun = any(
+                c["NOME"] == nome and c["MUNICIPIO"] == municipio
+                and c["DATA"].isocalendar()[1] == semana
+                and c["PRESIDENTE"] == "NAO"
                 for c in convocados
             )
-            if ja_convocado_mesmo_mun:
+            if ja_mesmo_mun:
                 continue
-            if contagem_convocacoes[nome]<3 or len(selecionados)<(int(qtd)-1):
-                contagem_convocacoes[nome]+=1
+            if cont_conv[nome] < 3 or len(selecionados) < (qtd-1):
+                cont_conv[nome] += 1
                 selecionados.append(nome)
-            if len(selecionados)>=(int(qtd)-1):
+            if len(selecionados) >= (qtd-1):
                 break
+
         for nome in selecionados:
-            row_sel = pool_rest[pool_rest["NOME"]==nome].iloc[0]
+            linha = pool_aux[pool_aux["NOME"]==nome].iloc[0]
             convocados.append({
-                "DIA": dia,
-                "DATA": data.date(),
-                "MUNICIPIO": municipio,
-                "NOME": nome,
-                "CATEGORIA": row_sel["CATEGORIA"],
-                "PRESIDENTE": "NÃO"
+                "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
+                "NOME": nome, "CATEGORIA": linha["CATEGORIA"], "PRESIDENTE": "NAO"
             })
 
-    # ----------------------- DataFrames finais -----------------------
-    df_convocados = pd.DataFrame(convocados).drop_duplicates()
-    df_nao_convocados = pd.DataFrame(nao_convocados).drop_duplicates(subset=["NOME","DIA","CATEGORIA"])
+        # Registro não convocados
+        todos_nomes = [c["NOME"] for c in convocados]
+        eliminados = df[~df["NOME"].isin(todos_nomes)]
+        for _, r in eliminados.iterrows():
+            motivo = ""
+            if matching_count(r["CATEGORIA"], categoria_oper) < 2 and len(categoria_oper.split(",")) > 1:
+                motivo = "Incompativel"
+            elif r["MUNICIPIO_ORIGEM"] == municipio:
+                motivo = "Mesmo municipio"
+            else:
+                motivo = "Indisponivel"
+            nao_conv.append({
+                "NOME": r["NOME"], "DIA": dia, "CATEGORIA": r["CATEGORIA"],
+                "MUNICIPIO_ORIGEM": r["MUNICIPIO_ORIGEM"],
+                "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA",""),
+                "DATA": data.date(), "MOTIVO": motivo
+            })
 
-    # ----------------------- Exportação Excel -----------------------
-    nome_saida = "Distribuicao_Convocacoes.xlsx"
+    df_conv = pd.DataFrame(convocados).drop_duplicates()
+    df_nao = pd.DataFrame(nao_conv).drop_duplicates(subset=["NOME","DIA","CATEGORIA"])
+
+    # Excel
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
-    for r in dataframe_to_rows(df_convocados, index=False, header=True):
+    for r in dataframe_to_rows(df_conv, index=False, header=True):
         ws1.append(r)
     ws2 = wb.create_sheet("Nao Convocados")
-    for r in dataframe_to_rows(df_nao_convocados, index=False, header=True):
+    for r in dataframe_to_rows(df_nao, index=False, header=True):
         ws2.append(r)
-    buffer = BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return nome_saida, df_convocados, df_nao_convocados, buffer
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return "Distribuicao_Convocacoes.xlsx", df_conv, df_nao, buf
 
-# ----------------------- Interface Streamlit Estilizada -----------------------
-st.set_page_config(page_title="Distribuição Equilibrada", page_icon="📊", layout="centered")
+# ==============================
+# Interface Streamlit
+# ==============================
+st.set_page_config(page_title="Distribuição Equilibrada", page_icon="⚖️", layout="centered")
 
-page_bg = """
+st.markdown("""
 <style>
-.stApp { background: linear-gradient(135deg, #002b45, #014d63, #028090); background-attachment: fixed; color: white; font-family: 'Segoe UI', sans-serif; }
-.main-card { background: rgba(255, 255, 255, 0.08); border-radius: 20px; padding: 40px; box-shadow: 0 8px 25px rgba(0,0,0,0.4); text-align: center; margin-top: 40px; }
-.main-card h1 { font-size: 2.2rem; font-weight: 700; color: #ffffff; margin-bottom: 15px; }
-.main-card p { font-size: 1.1rem; color: #dcdcdc; margin-bottom: 30px; }
-.stButton button { background: linear-gradient(90deg, #00c6ff, #0072ff); color: white; border: none; border-radius: 12px; padding: 12px 25px; font-size: 1rem; font-weight: bold; transition: 0.3s; }
-.stButton button:hover { transform: scale(1.05); background: linear-gradient(90deg, #0072ff, #00c6ff); }
+.stApp {background: linear-gradient(135deg, #003c63, #015e78, #027b91);
+background-attachment: fixed; color: white; font-family: 'Segoe UI', sans-serif;}
+.main-card {background: rgba(255,255,255,0.08); border-radius:20px; padding:40px;
+box-shadow: 0 8px 25px rgba(0,0,0,0.4); text-align:center; margin-top:40px;}
+.main-card h1 {font-size:2.2rem; font-weight:700; color:#fff;}
+.main-card p {font-size:1.1rem; color:#dcdcdc;}
+.stButton button {background: linear-gradient(90deg,#00c6ff,#0072ff);
+color:white; border:none; border-radius:12px; padding:12px 25px;
+font-size:1rem; font-weight:bold; transition:0.3s;}
+.stButton button:hover {transform:scale(1.05); background:linear-gradient(90deg,#0072ff,#00c6ff);}
 </style>
-"""
-st.markdown(page_bg, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 st.markdown("""
 <div class="main-card">
-<h1>📊 Distribuição Equilibrada de Convocações</h1>
-<p>O sistema distribui as convocações respeitando todas as regras, garantindo 1 presidente por operação, compatibilidade mínima de categorias, limite de convocações, indisponibilidade e municípios de origem. Inclui regras especiais POÁ e Santo André sexta-feira, além de restrição de convocação na mesma semana.</p>
+<h1>⚖️ Distribuição Equilibrada de Convocações</h1>
+<p>O sistema aplica todas as regras de convocação, respeitando indisponibilidades absolutas de dias, limite de convocações, compatibilidade mínima de categorias e equilíbrio semanal.</p>
 </div>
 """, unsafe_allow_html=True)
 
 arquivo = st.file_uploader("📁 Envie a planilha (.xlsx)", type="xlsx")
 
 if arquivo:
-    try:
-        st.markdown("### ⚙️ Processamento")
-        st.info("Clique no botão abaixo para gerar a distribuição equilibrada.")
-        if st.button("🔄 Gerar Distribuição"):
-            with st.spinner("Processando..."):
-                nome_saida, df_convocados, df_nao_convocados, arquivo_excel = processar_distribuicao(arquivo)
-                if df_convocados.empty and df_nao_convocados.empty:
-                    st.error("⚠️ Não foi possível gerar a distribuição. Verifique a planilha enviada.")
-                else:
-                    st.success("✅ Distribuição gerada com sucesso!")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("### 👥 Convocados")
-                        st.dataframe(df_convocados, use_container_width=True)
-                    with col2:
-                        st.markdown("### 🚫 Não Convocados")
-                        st.dataframe(df_nao_convocados, use_container_width=True)
-                    b64 = base64.b64encode(arquivo_excel.read()).decode()
-                    st.markdown(f"""
-                    <div style="text-align:center; margin-top:30px;">
-                    <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
-                    download="{nome_saida}" target="_blank"
-                    style="background:linear-gradient(90deg, #00c6ff, #0072ff); padding:12px 25px;
-                    color:white; text-decoration:none; border-radius:12px; font-size:16px; font-weight:bold;">
-                    ⬇️ Baixar Excel
-                    </a></div>""", unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"❌ Erro ao processar o arquivo: {e}")
+    st.markdown("### ⚙️ Processamento")
+    if st.button("🔄 Gerar Distribuição"):
+        with st.spinner("Processando..."):
+            try:
+                nome_saida, df_conv, df_nao, buf = processar_distribuicao(arquivo)
+                st.success("✅ Distribuição gerada com sucesso!")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("### 👥 Convocados")
+                    st.dataframe(df_conv, use_container_width=True)
+                with col2:
+                    st.markdown("### 🚫 Não Convocados")
+                    st.dataframe(df_nao, use_container_width=True)
+
+                b64 = base64.b64encode(buf.read()).decode()
+                st.markdown(f"""
+                <div style="text-align:center; margin-top:30px;">
+                <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+                download="{nome_saida}" target="_blank"
+                style="background:linear-gradient(90deg,#00c6ff,#0072ff); padding:12px 25px;
+                color:white; text-decoration:none; border-radius:12px; font-size:16px; font-weight:bold;">
+                ⬇️ Baixar Excel
+                </a></div>""", unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"❌ Erro ao processar: {e}")
