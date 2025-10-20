@@ -63,16 +63,9 @@ def matching_count(categorias_pessoa, categorias_operacao):
 dias_map = {"SEGUNDA":0, "TERCA":1, "QUARTA":2, "QUINTA":3, "SEXTA":4, "SABADO":5, "DOMINGO":6}
 
 def esta_indisponivel(nome, dias_indisponiveis, inicio, fim, data):
-    """
-    Retorna True se a pessoa não pode ser convocada no dia.
-    Considera dias da semana e período de datas (como férias).
-    """
-    # Período de datas
     if pd.notna(inicio) and pd.notna(fim):
         if inicio.date() <= data.date() <= fim.date():
             return True
-
-    # Dias da semana
     if pd.isna(dias_indisponiveis) or dias_indisponiveis.strip() == "":
         return False
     dias = [d.strip().upper().replace("Ç","C").replace("Á","A") for d in dias_indisponiveis.split(",")]
@@ -80,67 +73,77 @@ def esta_indisponivel(nome, dias_indisponiveis, inicio, fim, data):
     return data.weekday() in dias_num
 
 # ==============================
+# 🌟 Regra especial: Vanessa (Auxiliar apenas)
+# ==============================
+def aplicar_regra_vanessa(df_candidatos, categoria_oper, data):
+    regra_ativa = False
+    if isinstance(categoria_oper, str) and categoria_oper.strip().upper() == "B":
+        nome_vanessa = "VANESSA APARECIDA CARVALHO DE ASSIS"
+        vanessa = df_candidatos[df_candidatos["NOME"].str.upper() == nome_vanessa]
+        if not vanessa.empty:
+            r = vanessa.iloc[0]
+            if not esta_indisponivel(
+                r["NOME"],
+                r.get("DIAS_INDISPONIBILIDADE", ""),
+                r.get("INICIO_INDISPONIBILIDADE"),
+                r.get("FIM_INDISPONIBILIDADE"),
+                data
+            ):
+                resto = df_candidatos[df_candidatos["NOME"].str.upper() != nome_vanessa]
+                df_candidatos = pd.concat([vanessa, resto]).reset_index(drop=True)
+                regra_ativa = True
+    return df_candidatos, regra_ativa
+
+# ==============================
 # 🧠 Processamento principal
 # ==============================
 def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
     df = normalizar_colunas(df)
-
-    # Conversão de datas
     for col in ["DATA", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
     df["DATA"].fillna(method="ffill", inplace=True)
     df["DIA"].fillna(method="ffill", inplace=True)
-
     if "QUANTIDADE" not in df.columns:
         df["QUANTIDADE"] = 1
     df["QUANTIDADE"] = df["QUANTIDADE"].fillna(0).astype(int)
 
     cont_conv = {n: 0 for n in df["NOME"].unique()}
     cont_pres = {n: 0 for n in df["NOME"].unique()}
+    convocados, nao_conv, mensagens_vanessa = [], [], []
 
-    convocados, nao_conv = [], []
-
-    # Agrupar por operação
     operacoes = df.groupby(["DIA", "DATA", "MUNICIPIO", "CATEGORIA", "QUANTIDADE"], dropna=False)
     for (dia, data, municipio, categoria_oper, qtd), _ in operacoes:
         qtd = int(qtd)
-        if qtd <= 0:
-            continue
-
-        # Candidatos de outros municípios
+        if qtd <= 0: continue
         candidatos = df[df["MUNICIPIO_ORIGEM"] != municipio].copy().reset_index(drop=True)
-
-        # Aplicar indisponibilidade
         candidatos = candidatos.loc[
             ~candidatos.apply(
                 lambda r: esta_indisponivel(
-                    r["NOME"],
-                    r.get("DIAS_INDISPONIBILIDADE", ""),
+                    r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""),
                     r.get("INICIO_INDISPONIBILIDADE"),
                     r.get("FIM_INDISPONIBILIDADE"),
                     data
-                ),
-                axis=1
+                ), axis=1
             )
         ].reset_index(drop=True)
-        if candidatos.empty:
-            continue
+        if candidatos.empty: continue
 
-        # Compatibilidade de categorias
         candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
         if len(categoria_oper.split(",")) == 1:
             candidatos_validos = candidatos[candidatos["MATCH_COUNT"] >= 1].reset_index(drop=True)
         else:
             candidatos_validos = candidatos[candidatos["MATCH_COUNT"] >= 2].reset_index(drop=True)
-        if candidatos_validos.empty:
-            continue
+        if candidatos_validos.empty: continue
         candidatos = candidatos_validos
+
+        candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
+        if vanessa_ativa:
+            mensagens_vanessa.append(f"✨ Vanessa priorizada em {municipio} em {data.date()}")
 
         # Seleção presidente
         pres_cand = candidatos[candidatos["PRESIDENTE_DE_BANCA"].astype(str).str.upper() == "SIM"]
-
         nomes_ja_convocados = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
         pres_cand = pres_cand[~pres_cand["NOME"].isin(nomes_ja_convocados)]
 
@@ -149,19 +152,15 @@ def processar_distribuicao(arquivo):
             presidente = pres_cand[pres_cand["NOME"] == nome_pres].iloc[0]
         else:
             candidatos_disponiveis = candidatos[~candidatos["NOME"].isin(nomes_ja_convocados)]
-            if candidatos_disponiveis.empty:
-                continue
+            if candidatos_disponiveis.empty: continue
             nome_pres = sorted(candidatos_disponiveis["NOME"].unique(), key=lambda n: cont_pres[n])[0]
             presidente = candidatos_disponiveis[candidatos_disponiveis["NOME"] == nome_pres].iloc[0]
 
         cont_conv[presidente["NOME"]] += 1
         cont_pres[presidente["NOME"]] += 1
         convocados.append({
-            "DIA": dia,
-            "DATA": data.date(),
-            "MUNICIPIO": municipio,
-            "NOME": presidente["NOME"],
-            "CATEGORIA": presidente["CATEGORIA"],
+            "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
+            "NOME": presidente["NOME"], "CATEGORIA": presidente["CATEGORIA"],
             "PRESIDENTE": "SIM"
         })
 
@@ -172,7 +171,6 @@ def processar_distribuicao(arquivo):
         pool_aux = pool_aux.sort_values(by="CONV_COUNT").reset_index(drop=True)
         selecionados = []
         semana = data.isocalendar()[1]
-
         for _, r in pool_aux.iterrows():
             nome = r["NOME"]
             if any(c["NOME"] == nome and c["DATA"] == data.date() for c in convocados):
@@ -181,24 +179,17 @@ def processar_distribuicao(arquivo):
                 c["NOME"] == nome and c["MUNICIPIO"] == municipio and c["DATA"].isocalendar()[1] == semana and c["PRESIDENTE"] == "NAO"
                 for c in convocados
             )
-            if ja_mesmo_mun:
-                continue
-
+            if ja_mesmo_mun: continue
             if cont_conv[nome] < 3 or len(selecionados) < (qtd-1):
                 cont_conv[nome] += 1
                 selecionados.append(nome)
-            if len(selecionados) >= (qtd-1):
-                break
+            if len(selecionados) >= (qtd-1): break
 
         for nome in selecionados:
             linha = pool_aux[pool_aux["NOME"] == nome].iloc[0]
             convocados.append({
-                "DIA": dia,
-                "DATA": data.date(),
-                "MUNICIPIO": municipio,
-                "NOME": nome,
-                "CATEGORIA": linha["CATEGORIA"],
-                "PRESIDENTE": "NAO"
+                "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
+                "NOME": nome, "CATEGORIA": linha["CATEGORIA"], "PRESIDENTE": "NAO"
             })
 
         # Registro não convocados
@@ -210,29 +201,17 @@ def processar_distribuicao(arquivo):
                 motivo = "Incompativel"
             elif r["MUNICIPIO_ORIGEM"] == municipio:
                 motivo = "Mesmo municipio"
-            elif esta_indisponivel(
-                r["NOME"],
-                r.get("DIAS_INDISPONIBILIDADE", ""),
-                r.get("INICIO_INDISPONIBILIDADE"),
-                r.get("FIM_INDISPONIBILIDADE"),
-                data
-            ):
+            elif esta_indisponivel(r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data):
                 motivo = "Indisponivel"
             nao_conv.append({
-                "NOME": r["NOME"],
-                "DIA": dia,
-                "CATEGORIA": r["CATEGORIA"],
-                "MUNICIPIO_ORIGEM": r["MUNICIPIO_ORIGEM"],
-                "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA",""),
-                "DATA": data.date(),
-                "MOTIVO": motivo
+                "NOME": r["NOME"], "DIA": dia,
+                "CATEGORIA": r["CATEGORIA"], "MUNICIPIO_ORIGEM": r["MUNICIPIO_ORIGEM"],
+                "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
             })
 
-    # DataFrames finais
     df_conv = pd.DataFrame(convocados).drop_duplicates()
     df_nao = pd.DataFrame(nao_conv).drop_duplicates(subset=["NOME","DIA","CATEGORIA"])
 
-    # Criar Excel
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
@@ -245,7 +224,7 @@ def processar_distribuicao(arquivo):
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return "Distribuicao_Convocacoes.xlsx", df_conv, df_nao, buf
+    return "Distribuicao_Convocacoes.xlsx", df_conv, df_nao, buf, mensagens_vanessa
 
 # ==============================
 # Interface Streamlit
@@ -277,7 +256,7 @@ if arquivo:
     if st.button("🔄 Gerar Distribuição"):
         with st.spinner("Processando..."):
             try:
-                nome_saida, df_conv, df_nao, buf = processar_distribuicao(arquivo)
+                nome_saida, df_conv, df_nao, buf, msgs_vanessa = processar_distribuicao(arquivo)
                 st.success("✅ Distribuição gerada com sucesso!")
 
                 col1, col2 = st.columns(2)
@@ -287,6 +266,11 @@ if arquivo:
                 with col2:
                     st.markdown("### 🚫 Não Convocados")
                     st.dataframe(df_nao, use_container_width=True)
+
+                if msgs_vanessa:
+                    st.markdown("### 🌟 Regras Especiais Aplicadas")
+                    for m in msgs_vanessa:
+                        st.markdown(f"- {m}")
 
                 b64 = base64.b64encode(buf.read()).decode()
                 st.markdown(f"""
