@@ -65,21 +65,13 @@ def matching_count(categorias_pessoa, categorias_operacao):
 # ==============================
 dias_map = {"SEGUNDA":0, "TERCA":1, "QUARTA":2, "QUINTA":3, "SEXTA":4, "SABADO":5, "DOMINGO":6}
 def esta_indisponivel(nome, dias_indisponiveis, inicio, fim, data):
-    """
-    ⚠️ Prioridade: DIAS_INDISPONIBILIDADE > INICIO/FIM.
-    - Se o dia atual estiver na lista de dias específicos, a pessoa não pode ser chamada.
-    - Caso contrário, ela pode ser chamada, mesmo dentro do período de indisponibilidade.
-    """
-    # Verifica dias específicos primeiro
     if pd.notna(dias_indisponiveis) and str(dias_indisponiveis).strip() != "":
         dias = [d.strip().upper().replace("Ç","C").replace("Á","A") for d in str(dias_indisponiveis).split(",")]
         dias_num = [dias_map[d] for d in dias if d in dias_map]
         if data.weekday() in dias_num:
-            return True  # bloqueado
+            return True
         else:
-            return False  # liberado, mesmo dentro do período
-    
-    # Se não houver dias específicos, considera período completo
+            return False
     if pd.notna(inicio) and pd.notna(fim):
         try:
             if inicio.date() <= data.date() <= fim.date():
@@ -136,6 +128,11 @@ def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_gl
 def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
     df = normalizar_colunas(df)
+    
+    # Garante que a coluna PRESIDENTE_DE_BANCA exista
+    if "PRESIDENTE_DE_BANCA" not in df.columns:
+        df["PRESIDENTE_DE_BANCA"] = "NAO"
+    
     for col in ["DATA", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -247,29 +244,23 @@ def processar_distribuicao(arquivo):
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados (novo padrão) ---
+    # --- Aba de não convocados (ignora quem nunca participou) ---
     dias_nao_chamados = []
+    nomes_participaram = df_conv["NOME"].unique()
     for _, r in df.iterrows():
         nome = r["NOME"]
+        if nome not in nomes_participaram:
+            continue  # ignora
         df_chamados = df_conv[df_conv["NOME"] == nome]
-        if df_chamados.empty:
+        dias_faltantes = sorted(set(df["DIA"]) - set(df_chamados["DIA"]))
+        for dia_falt in dias_faltantes:
             dias_nao_chamados.append({
                 "NOME": nome,
-                "DIA": r.get("DIA",""),
+                "DIA": dia_falt,
                 "CATEGORIA": r.get("CATEGORIA",""),
                 "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
                 "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
             })
-        else:
-            dias_faltantes = sorted(set(df["DIA"]) - set(df_chamados["DIA"]))
-            for dia_falt in dias_faltantes:
-                dias_nao_chamados.append({
-                    "NOME": nome,
-                    "DIA": dia_falt,
-                    "CATEGORIA": r.get("CATEGORIA",""),
-                    "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
-                    "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
-                })
 
     df_nao = pd.DataFrame(dias_nao_chamados)
 
@@ -339,4 +330,3 @@ if arquivo:
             ⬇️ Baixar Excel
             </a></div>
             """, unsafe_allow_html=True)
-
