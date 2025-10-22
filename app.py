@@ -239,14 +239,15 @@ def processar_distribuicao(arquivo):
         # --- Adiciona ao resultado final ---
         for i, nome in enumerate(total_selecionados):
             cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
+            presidente_flag = "SIM" if nome == presidente["NOME"] else "NAO"
             convocados.append({
                 "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
-                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": "SIM" if nome == presidente["NOME"] else "NAO"
+                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag
             })
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados com dias que não foram chamados ---
+    # --- Aba de não convocados (novo padrão) ---
     dias_nao_chamados = []
     for _, r in df.iterrows():
         nome = r["NOME"]
@@ -254,22 +255,25 @@ def processar_distribuicao(arquivo):
         if df_chamados.empty:
             dias_nao_chamados.append({
                 "NOME": nome,
-                "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
+                "DIA": r.get("DIA",""),
                 "CATEGORIA": r.get("CATEGORIA",""),
-                "DIAS_NAO_CONVOCADOS": r.get("DIA","")
+                "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
+                "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
             })
         else:
             dias_faltantes = sorted(set(df["DIA"]) - set(df_chamados["DIA"]))
-            if dias_faltantes:
+            for dia_falt in dias_faltantes:
                 dias_nao_chamados.append({
                     "NOME": nome,
-                    "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
+                    "DIA": dia_falt,
                     "CATEGORIA": r.get("CATEGORIA",""),
-                    "DIAS_NAO_CONVOCADOS": ", ".join(dias_faltantes)
+                    "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
+                    "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
                 })
 
     df_nao = pd.DataFrame(dias_nao_chamados)
 
+    # --- Criando planilha Excel ---
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Convocados"
@@ -335,3 +339,4 @@ if arquivo:
             ⬇️ Baixar Excel
             </a></div>
             """, unsafe_allow_html=True)
+
