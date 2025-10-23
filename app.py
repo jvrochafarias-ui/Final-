@@ -9,12 +9,6 @@ import locale
 import unicodedata
 
 # ==============================
-# ⚙️ Configuração interna
-# ==============================
-META_CONVOCACOES_TENTATIVA = 3
-META_CONVOCACOES_MINIMA = 2
-
-# ==============================
 # ⚙️ Configuração de locale
 # ==============================
 try:
@@ -56,9 +50,9 @@ def normalizar_colunas(df):
 def matching_count(categorias_pessoa, categorias_operacao):
     if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
         return 0
-    pessoa = [x.strip().upper() for x in categorias_pessoa.split(",") if x.strip()]
-    oper = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
-    return sum(1 for c in oper if c in pessoa)
+    pessoa = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
+    oper = set(x.strip().upper() for x in categorias_operacao.split(",") if x.strip())
+    return 1 if len(pessoa & oper) > 0 else 0
 
 # ==============================
 # 🚫 Verificação de indisponibilidade / férias
@@ -70,8 +64,7 @@ def esta_indisponivel(nome, dias_indisponiveis, inicio, fim, data):
         dias_num = [dias_map[d] for d in dias if d in dias_map]
         if data.weekday() in dias_num:
             return True
-        else:
-            return False
+        return False
     if pd.notna(inicio) and pd.notna(fim):
         try:
             if inicio.date() <= data.date() <= fim.date():
@@ -96,17 +89,18 @@ def aplicar_regra_vanessa(df_candidatos, categoria_oper, data):
     return df_candidatos, False
 
 # ==============================
-# 🔧 Evita repetir município na mesma semana (R2) ignorando presidentes
+# 🔧 Evita repetição no mesmo dia e evita município de origem
 # ==============================
-def filtrar_repeticao_municipio(df_candidatos, municipio, data, convocados):
-    semana_atual = data.isocalendar()[1]
-    municipio_semana = {(c["NOME"], c["MUNICIPIO"], c["DATA"].isocalendar()[1])
-                        for c in convocados if c["PRESIDENTE"] != "SIM"}
-    candidatos_filtrados = df_candidatos[~df_candidatos["NOME"].apply(lambda n: (n, municipio, semana_atual) in municipio_semana)].copy()
+def filtrar_candidatos(df_candidatos, municipio, data, convocados):
+    nomes_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
+    candidatos_filtrados = df_candidatos[
+        (~df_candidatos["NOME"].isin(nomes_no_dia)) &
+        (df_candidatos["MUNICIPIO_ORIGEM"] != municipio)
+    ].copy()
     return candidatos_filtrados
 
 # ==============================
-# 🔧 Peso de frequência semanal (R1)
+# 🔧 Peso de frequência semanal
 # ==============================
 def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_global):
     semana = data.isocalendar()[1]
@@ -114,7 +108,7 @@ def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_gl
         nome = r["NOME"]
         conv_semana = conv_semana_global.get((nome, semana), 0)
         match = matching_count(r.get("CATEGORIA",""), categoria_oper)
-        return (match * 10) + max(0, (META_CONVOCACOES_TENTATIVA - conv_semana))
+        return (match * 10) + max(0, 5 - conv_semana)
     if df_candidatos.empty:
         return df_candidatos
     df_candidatos = df_candidatos.copy()
@@ -129,7 +123,6 @@ def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
     df = normalizar_colunas(df)
     
-    # Garante que a coluna PRESIDENTE_DE_BANCA exista
     if "PRESIDENTE_DE_BANCA" not in df.columns:
         df["PRESIDENTE_DE_BANCA"] = "NAO"
     
@@ -146,7 +139,6 @@ def processar_distribuicao(arquivo):
     df["QUANTIDADE"] = df["QUANTIDADE"].fillna(0).astype(int)
 
     nomes_unicos = df["NOME"].unique()
-    cont_conv = {n: 0 for n in nomes_unicos}
     cont_pres = {n: 0 for n in nomes_unicos}
     conv_semana_global = {}
 
@@ -166,60 +158,56 @@ def processar_distribuicao(arquivo):
             r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data
         ), axis=1)].reset_index(drop=True)
 
-        # --- Evita duplicação no mesmo dia ---
-        nomes_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
-        candidatos = candidatos[~candidatos["NOME"].isin(nomes_no_dia)].reset_index(drop=True)
-
-        # --- Filtra repetição de município na mesma semana (R2) ---
-        candidatos_filtrados_muni = filtrar_repeticao_municipio(candidatos, municipio, data, convocados)
-        candidatos_para_usar = candidatos_filtrados_muni.copy()
-        if len(candidatos_para_usar) < max(qtd, 1):
-            candidatos_para_usar = candidatos.copy()
+        # --- Filtra repetição no dia e município de origem ---
+        candidatos = filtrar_candidatos(candidatos, municipio, data, convocados)
 
         # --- Calcula MATCH_COUNT e aplica regra Vanessa ---
-        candidatos_para_usar["MATCH_COUNT"] = candidatos_para_usar["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
-        candidatos_para_usar, vanessa_ativa = aplicar_regra_vanessa(candidatos_para_usar, categoria_oper, data)
+        candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
+        candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
         if vanessa_ativa:
             mensagens_vanessa.append(f"✨ Vanessa priorizada em {municipio} ({data.date()})")
 
+        # --- Mantém apenas candidatos compatíveis com a operação ---
+        candidatos = candidatos[candidatos["MATCH_COUNT"] > 0]
+        if candidatos.empty:
+            continue
+
         # --- Aplica regra de frequência (PESO) ---
-        candidatos_pesados = aplicar_regra_frequencia(candidatos_para_usar, data, categoria_oper, conv_semana_global)
+        candidatos_pesados = aplicar_regra_frequencia(candidatos, data, categoria_oper, conv_semana_global)
 
         # --- Seleciona presidente ---
         pres_cand = candidatos_pesados[candidatos_pesados["PRESIDENTE_DE_BANCA"].astype(str).str.upper() == "SIM"]
         pres_cand = pres_cand[~pres_cand["NOME"].isin(
-            [c["NOME"] for c in convocados if c["DATA"].isocalendar()[1] == data.isocalendar()[1] and c["MUNICIPIO"] == municipio and c["PRESIDENTE"] == "SIM"]
+            [c["NOME"] for c in convocados if c["DATA"] == data.date() and c["PRESIDENTE"] == "SIM"]
         )]
+        presidente = None
         if not pres_cand.empty:
             nome_pres = sorted(pres_cand["NOME"].unique(), key=lambda n: cont_pres.get(n,0))[0]
             presidente = pres_cand[pres_cand["NOME"] == nome_pres].iloc[0]
-        else:
-            nome_pres = sorted(candidatos_pesados["NOME"].unique(), key=lambda n: cont_pres.get(n,0))[0]
-            presidente = candidatos_pesados[candidatos_pesados["NOME"] == nome_pres].iloc[0]
-
-        cont_pres[presidente["NOME"]] = cont_pres.get(presidente["NOME"], 0) + 1
-        cont_conv[presidente["NOME"]] = cont_conv.get(presidente["NOME"], 0) + 1
-        semana_pres = data.isocalendar()[1]
-        conv_semana_global[(presidente["NOME"], semana_pres)] = conv_semana_global.get((presidente["NOME"], semana_pres), 0) + 1
+            cont_pres[presidente["NOME"]] = cont_pres.get(presidente["NOME"], 0) + 1
+            semana_pres = data.isocalendar()[1]
+            conv_semana_global[(presidente["NOME"], semana_pres)] = conv_semana_global.get((presidente["NOME"], semana_pres), 0) + 1
 
         # --- Seleciona demais participantes ---
-        pool = candidatos_pesados[candidatos_pesados["NOME"] != presidente["NOME"]].copy()
-        pool["MATCH_COUNT"] = pool["MATCH_COUNT"].fillna(0)
+        pool = candidatos_pesados.copy()
+        if presidente is not None:
+            pool = pool[pool["NOME"] != presidente["NOME"]]
         pool = pool.sort_values(by=["PESO"], ascending=False)
 
+        nomes_ja_convocados_no_dia = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
         selecionados = []
         for _, r in pool.iterrows():
-            if len(selecionados) >= (qtd - 1):
+            if len(selecionados) >= (qtd - (1 if presidente is not None else 0)):
                 break
             nome = r["NOME"]
-            if nome not in [c["NOME"] for c in convocados if c["DATA"] == data.date()]:
+            if nome not in nomes_ja_convocados_no_dia:
                 selecionados.append(nome)
-                cont_conv[nome] = cont_conv.get(nome, 0) + 1
+                nomes_ja_convocados_no_dia.append(nome)
                 semana_sel = data.isocalendar()[1]
                 conv_semana_global[(nome, semana_sel)] = conv_semana_global.get((nome, semana_sel), 0) + 1
 
         # --- FORÇAR PREENCHIMENTO CASO FALTEM VAGAS ---
-        total_selecionados = [presidente["NOME"]] + selecionados
+        total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
         faltantes = qtd - len(total_selecionados)
         if faltantes > 0:
             extras = candidatos[~candidatos["NOME"].isin(total_selecionados)].copy()
@@ -227,16 +215,18 @@ def processar_distribuicao(arquivo):
             for _, r in extras.iterrows():
                 if faltantes == 0:
                     break
-                total_selecionados.append(r["NOME"])
-                cont_conv[r["NOME"]] = cont_conv.get(r["NOME"], 0) + 1
-                semana_sel = data.isocalendar()[1]
-                conv_semana_global[(r["NOME"], semana_sel)] = conv_semana_global.get((r["NOME"], semana_sel), 0) + 1
-                faltantes -= 1
+                nome = r["NOME"]
+                if nome not in nomes_ja_convocados_no_dia:
+                    total_selecionados.append(nome)
+                    nomes_ja_convocados_no_dia.append(nome)
+                    semana_sel = data.isocalendar()[1]
+                    conv_semana_global[(nome, semana_sel)] = conv_semana_global.get((nome, semana_sel), 0) + 1
+                    faltantes -= 1
 
         # --- Adiciona ao resultado final ---
         for i, nome in enumerate(total_selecionados):
             cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
-            presidente_flag = "SIM" if nome == presidente["NOME"] else "NAO"
+            presidente_flag = "SIM" if presidente is not None and nome == presidente["NOME"] else "NAO"
             convocados.append({
                 "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
                 "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag
@@ -244,25 +234,24 @@ def processar_distribuicao(arquivo):
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados (ignora quem nunca participou) ---
+    # --- Aba de não convocados (ignora férias/indisponibilidade) ---
     dias_nao_chamados = []
-    nomes_participaram = df_conv["NOME"].unique()
     for _, r in df.iterrows():
         nome = r["NOME"]
-        if nome not in nomes_participaram:
-            continue  # ignora
-        df_chamados = df_conv[df_conv["NOME"] == nome]
-        dias_faltantes = sorted(set(df["DIA"]) - set(df_chamados["DIA"]))
-        for dia_falt in dias_faltantes:
-            dias_nao_chamados.append({
-                "NOME": nome,
-                "DIA": dia_falt,
-                "CATEGORIA": r.get("CATEGORIA",""),
-                "MUNICIPIO_ORIGEM": r.get("MUNICIPIO_ORIGEM",""),
-                "PRESIDENTE_DE_BANCA": r.get("PRESIDENTE_DE_BANCA","")
-            })
-
-    df_nao = pd.DataFrame(dias_nao_chamados)
+        is_presidente = "SIM" if str(r.get("PRESIDENTE_DE_BANCA","NAO")).upper() == "SIM" else "NAO"
+        for dia, data, categoria in zip(df["DIA"], df["DATA"], df["CATEGORIA"]):
+            data_dt = pd.to_datetime(data)
+            if esta_indisponivel(nome, r.get("DIAS_INDISPONIBILIDADE",""), r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data_dt):
+                continue
+            df_chamados_no_dia = df_conv[(df_conv["NOME"] == nome) & (df_conv["DATA"] == data_dt.date())]
+            if df_chamados_no_dia.empty:
+                dias_nao_chamados.append({
+                    "NOME": nome,
+                    "DIA": dia,
+                    "CATEGORIA": categoria,
+                    "PRESIDENTE": is_presidente
+                })
+    df_nao = pd.DataFrame(dias_nao_chamados).drop_duplicates()
 
     # --- Criando planilha Excel ---
     wb = Workbook()
@@ -277,7 +266,7 @@ def processar_distribuicao(arquivo):
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return "Distribuicao_Completa.xlsx", df_conv, df_nao, buf, mensagens_vanessa
+    return "Distribuicao_Completa.xlsx", df_conv, df_nao, buf, []
 
 # ==============================
 # 💻 Interface Streamlit
@@ -298,7 +287,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-card">
 <h1>⚖️ Distribuição Equilibrada e Completa</h1>
-<p>O sistema garante sempre 100% das vagas preenchidas e evita convocações duplicadas no mesmo dia.</p>
+<p>O sistema garante sempre 100% das vagas preenchidas com pelo menos um presidente real, evitando convocações duplicadas no mesmo dia e nenhum convocado no seu município de origem.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -317,11 +306,6 @@ if arquivo:
             with col2:
                 st.markdown("### 🚫 Não Convocados")
                 st.dataframe(df_nao, use_container_width=True)
-
-            if msgs_vanessa:
-                st.markdown("### 🌟 Regras Especiais")
-                for m in msgs_vanessa:
-                    st.markdown(f"- {m}")
 
             b64 = base64.b64encode(buf.read()).decode()
             st.markdown(f"""
