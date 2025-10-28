@@ -45,14 +45,29 @@ def normalizar_colunas(df):
     return df
 
 # ==============================
-# 🔍 Contagem de categorias compatíveis
+# 🔍 Contagem de categorias compatíveis (atualizado)
 # ==============================
 def matching_count(categorias_pessoa, categorias_operacao):
+    """
+    Retorna 1 se o candidato tiver pelo menos a última categoria da operação
+    e a primeira categoria também; caso contrário, retorna 0.
+    """
     if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
         return 0
-    pessoa = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
-    oper = set(x.strip().upper() for x in categorias_operacao.split(",") if x.strip())
-    return 1 if len(pessoa & oper) > 0 else 0
+
+    pessoa_set = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
+    oper_list = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
+
+    if not oper_list:
+        return 0
+
+    primeira = oper_list[0]
+    ultima = oper_list[-1]
+
+    # Verifica última e depois primeira categoria
+    if ultima in pessoa_set and primeira in pessoa_set:
+        return 1
+    return 0
 
 # ==============================
 # 🚫 Verificação de indisponibilidade / férias
@@ -206,24 +221,8 @@ def processar_distribuicao(arquivo):
                 semana_sel = data.isocalendar()[1]
                 conv_semana_global[(nome, semana_sel)] = conv_semana_global.get((nome, semana_sel), 0) + 1
 
-        # --- FORÇAR PREENCHIMENTO CASO FALTEM VAGAS ---
-        total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
-        faltantes = qtd - len(total_selecionados)
-        if faltantes > 0:
-            extras = candidatos[~candidatos["NOME"].isin(total_selecionados)].copy()
-            extras = aplicar_regra_frequencia(extras, data, categoria_oper, conv_semana_global)
-            for _, r in extras.iterrows():
-                if faltantes == 0:
-                    break
-                nome = r["NOME"]
-                if nome not in nomes_ja_convocados_no_dia:
-                    total_selecionados.append(nome)
-                    nomes_ja_convocados_no_dia.append(nome)
-                    semana_sel = data.isocalendar()[1]
-                    conv_semana_global[(nome, semana_sel)] = conv_semana_global.get((nome, semana_sel), 0) + 1
-                    faltantes -= 1
-
         # --- Adiciona ao resultado final ---
+        total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
         for i, nome in enumerate(total_selecionados):
             cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
             presidente_flag = "SIM" if presidente is not None and nome == presidente["NOME"] else "NAO"
@@ -234,24 +233,10 @@ def processar_distribuicao(arquivo):
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados (ignora férias/indisponibilidade) ---
-    dias_nao_chamados = []
-    for _, r in df.iterrows():
-        nome = r["NOME"]
-        is_presidente = "SIM" if str(r.get("PRESIDENTE_DE_BANCA","NAO")).upper() == "SIM" else "NAO"
-        for dia, data, categoria in zip(df["DIA"], df["DATA"], df["CATEGORIA"]):
-            data_dt = pd.to_datetime(data)
-            if esta_indisponivel(nome, r.get("DIAS_INDISPONIBILIDADE",""), r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data_dt):
-                continue
-            df_chamados_no_dia = df_conv[(df_conv["NOME"] == nome) & (df_conv["DATA"] == data_dt.date())]
-            if df_chamados_no_dia.empty:
-                dias_nao_chamados.append({
-                    "NOME": nome,
-                    "DIA": dia,
-                    "CATEGORIA": categoria,
-                    "PRESIDENTE": is_presidente
-                })
-    df_nao = pd.DataFrame(dias_nao_chamados).drop_duplicates()
+    # --- Aba de não convocados ---
+    df_nao = df.copy()
+    df_nao = df_nao[~df_nao["NOME"].isin(df_conv["NOME"])]
+    df_nao = df_nao[["NOME", "DIA", "CATEGORIA", "PRESIDENTE_DE_BANCA"]].rename(columns={"PRESIDENTE_DE_BANCA":"PRESIDENTE"})
 
     # --- Criando planilha Excel ---
     wb = Workbook()
@@ -263,10 +248,23 @@ def processar_distribuicao(arquivo):
     for r in dataframe_to_rows(df_nao, index=False, header=True):
         ws2.append(r)
 
+    # Ajuste automático de largura das colunas
+    for ws in [ws1, ws2]:
+        for col in ws.columns:
+            max_length = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+            ws.column_dimensions[col_letter].width = max_length + 2
+
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return "Distribuicao_Completa.xlsx", df_conv, df_nao, buf, []
+    return "Distribuicao_Completa.xlsx", df_conv, df_nao, buf, mensagens_vanessa
 
 # ==============================
 # 💻 Interface Streamlit
