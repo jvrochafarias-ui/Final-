@@ -45,7 +45,7 @@ def normalizar_colunas(df):
     return df
 
 # ==============================
-# 🔍 Contagem de categorias compatíveis (atualizado)
+# 🔍 Contagem de categorias compatíveis (atualizado com fallback E)
 # ==============================
 def matching_count(categorias_pessoa, categorias_operacao):
     """
@@ -68,6 +68,35 @@ def matching_count(categorias_pessoa, categorias_operacao):
     if ultima in pessoa_set and primeira in pessoa_set:
         return 1
     return 0
+
+def matching_count_fallback(categorias_pessoa, categorias_operacao):
+    """
+    Igual a matching_count, mas com fallback para E.
+    """
+    if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
+        return 0
+
+    pessoa_set = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
+    oper_list = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
+
+    if not oper_list:
+        return 0
+
+    primeira = oper_list[0]
+    ultima = oper_list[-1]
+
+    # Categoria E obrigatória
+    precisa_E = "E" in oper_list
+
+    if precisa_E:
+        # Prioriza candidatos com E
+        if "E" in pessoa_set:
+            return 1 if ultima in pessoa_set and primeira in pessoa_set else 0
+        else:
+            # fallback: aceita mesmo sem E
+            return 1 if ultima in pessoa_set and primeira in pessoa_set else 1
+    else:
+        return 1 if ultima in pessoa_set and primeira in pessoa_set else 0
 
 # ==============================
 # 🚫 Verificação de indisponibilidade / férias
@@ -122,7 +151,7 @@ def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_gl
     def calcular_peso(r):
         nome = r["NOME"]
         conv_semana = conv_semana_global.get((nome, semana), 0)
-        match = matching_count(r.get("CATEGORIA",""), categoria_oper)
+        match = matching_count_fallback(r.get("CATEGORIA",""), categoria_oper)
         return (match * 10) + max(0, 5 - conv_semana)
     if df_candidatos.empty:
         return df_candidatos
@@ -177,17 +206,12 @@ def processar_distribuicao(arquivo):
         candidatos = filtrar_candidatos(candidatos, municipio, data, convocados)
 
         # --- Calcula MATCH_COUNT e aplica regra Vanessa ---
-        candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count(c, categoria_oper))
+        candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count_fallback(c, categoria_oper))
         candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
         if vanessa_ativa:
             mensagens_vanessa.append(f"✨ Vanessa priorizada em {municipio} ({data.date()})")
 
         # --- Mantém apenas candidatos compatíveis com a operação ---
-        candidatos = candidatos[candidatos["MATCH_COUNT"] > 0]
-        if candidatos.empty:
-            continue
-
-        # --- Aplica regra de frequência (PESO) ---
         candidatos_pesados = aplicar_regra_frequencia(candidatos, data, categoria_oper, conv_semana_global)
 
         # --- Seleciona presidente ---
@@ -285,7 +309,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-card">
 <h1>⚖️ Distribuição Equilibrada e Completa</h1>
-<p>O sistema garante sempre 100% das vagas preenchidas com pelo menos um presidente real, evitando convocações duplicadas no mesmo dia e nenhum convocado no seu município de origem.</p>
+<p>O sistema garante sempre 100% das vagas preenchidas com pelo menos um presidente real, evitando convocações duplicadas no mesmo dia e nenhum convocado no seu município de origem. Categoria “E” é priorizada quando exigida.</p>
 </div>
 """, unsafe_allow_html=True)
 
