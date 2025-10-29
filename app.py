@@ -45,55 +45,22 @@ def normalizar_colunas(df):
     return df
 
 # ==============================
-# 🔍 Contagem de categorias compatíveis (atualizado com fallback E)
+# 🔍 Contagem de categorias compatíveis (fallback E)
 # ==============================
-def matching_count(categorias_pessoa, categorias_operacao):
-    """
-    Retorna 1 se o candidato tiver pelo menos a última categoria da operação
-    e a primeira categoria também; caso contrário, retorna 0.
-    """
-    if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
-        return 0
-
-    pessoa_set = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
-    oper_list = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
-
-    if not oper_list:
-        return 0
-
-    primeira = oper_list[0]
-    ultima = oper_list[-1]
-
-    # Verifica última e depois primeira categoria
-    if ultima in pessoa_set and primeira in pessoa_set:
-        return 1
-    return 0
-
 def matching_count_fallback(categorias_pessoa, categorias_operacao):
-    """
-    Igual a matching_count, mas com fallback para E.
-    """
     if not isinstance(categorias_pessoa, str) or not isinstance(categorias_operacao, str):
         return 0
-
     pessoa_set = set(x.strip().upper() for x in categorias_pessoa.split(",") if x.strip())
     oper_list = [x.strip().upper() for x in categorias_operacao.split(",") if x.strip()]
-
     if not oper_list:
         return 0
-
     primeira = oper_list[0]
     ultima = oper_list[-1]
-
-    # Categoria E obrigatória
     precisa_E = "E" in oper_list
-
     if precisa_E:
-        # Prioriza candidatos com E
         if "E" in pessoa_set:
             return 1 if ultima in pessoa_set and primeira in pessoa_set else 0
         else:
-            # fallback: aceita mesmo sem E
             return 1 if ultima in pessoa_set and primeira in pessoa_set else 1
     else:
         return 1 if ultima in pessoa_set and primeira in pessoa_set else 0
@@ -196,25 +163,20 @@ def processar_distribuicao(arquivo):
             continue
         data = pd.to_datetime(data)
 
-        # --- Filtra indisponíveis / férias ---
         candidatos = df.copy()
         candidatos = candidatos.loc[~candidatos.apply(lambda r: esta_indisponivel(
             r["NOME"], r.get("DIAS_INDISPONIBILIDADE",""), r.get("INICIO_INDISPONIBILIDADE"), r.get("FIM_INDISPONIBILIDADE"), data
         ), axis=1)].reset_index(drop=True)
 
-        # --- Filtra repetição no dia e município de origem ---
         candidatos = filtrar_candidatos(candidatos, municipio, data, convocados)
 
-        # --- Calcula MATCH_COUNT e aplica regra Vanessa ---
         candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count_fallback(c, categoria_oper))
         candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
         if vanessa_ativa:
             mensagens_vanessa.append(f"✨ Vanessa priorizada em {municipio} ({data.date()})")
 
-        # --- Mantém apenas candidatos compatíveis com a operação ---
         candidatos_pesados = aplicar_regra_frequencia(candidatos, data, categoria_oper, conv_semana_global)
 
-        # --- Seleciona presidente ---
         pres_cand = candidatos_pesados[candidatos_pesados["PRESIDENTE_DE_BANCA"].astype(str).str.upper() == "SIM"]
         pres_cand = pres_cand[~pres_cand["NOME"].isin(
             [c["NOME"] for c in convocados if c["DATA"] == data.date() and c["PRESIDENTE"] == "SIM"]
@@ -227,7 +189,6 @@ def processar_distribuicao(arquivo):
             semana_pres = data.isocalendar()[1]
             conv_semana_global[(presidente["NOME"], semana_pres)] = conv_semana_global.get((presidente["NOME"], semana_pres), 0) + 1
 
-        # --- Seleciona demais participantes ---
         pool = candidatos_pesados.copy()
         if presidente is not None:
             pool = pool[pool["NOME"] != presidente["NOME"]]
@@ -245,7 +206,6 @@ def processar_distribuicao(arquivo):
                 semana_sel = data.isocalendar()[1]
                 conv_semana_global[(nome, semana_sel)] = conv_semana_global.get((nome, semana_sel), 0) + 1
 
-        # --- Adiciona ao resultado final ---
         total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
         for i, nome in enumerate(total_selecionados):
             cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
@@ -257,10 +217,66 @@ def processar_distribuicao(arquivo):
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados ---
-    df_nao = df.copy()
-    df_nao = df_nao[~df_nao["NOME"].isin(df_conv["NOME"])]
-    df_nao = df_nao[["NOME", "DIA", "CATEGORIA", "PRESIDENTE_DE_BANCA"]].rename(columns={"PRESIDENTE_DE_BANCA":"PRESIDENTE"})
+    # --- Aba de não convocados (corrigida) ---
+    dias_validos = df["DIA"].unique()
+    combinacoes = []
+    for nome in df["NOME"].unique():
+        for dia in dias_validos:
+            combinacoes.append({"NOME": nome, "DIA": dia})
+    base_completa = pd.DataFrame(combinacoes)
+    df_base = df[["NOME", "CATEGORIA", "PRESIDENTE_DE_BANCA",
+                  "DIAS_INDISPONIBILIDADE", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]].drop_duplicates(subset=["NOME"])
+
+    # --- FILTRAR quem está indisponível durante todo o período da operação ---
+    data_inicio_op = df['DATA'].min()
+    data_fim_op = df['DATA'].max()
+
+    def esta_totalmente_indisp(row):
+        # Dias da semana indisponíveis
+        dias = row.get("DIAS_INDISPONIBILIDADE","")
+        if pd.notna(dias) and str(dias).strip() != "":
+            dias_list = [d.strip().upper() for d in str(dias).split(",")]
+            if set(dias_list) == set(dias_map.keys()):
+                return True
+        # Intervalo de datas de indisponibilidade
+        inicio = row.get("INICIO_INDISPONIBILIDADE")
+        fim = row.get("FIM_INDISPONIBILIDADE")
+        if pd.notna(inicio) and pd.notna(fim):
+            if inicio.date() <= data_inicio_op.date() and fim.date() >= data_fim_op.date():
+                return True
+        return False
+
+    df_base = df_base[~df_base.apply(esta_totalmente_indisp, axis=1)]
+
+    df_nao = base_completa.merge(df_base, on="NOME", how="left")
+    convocados_dias = df_conv.groupby(["NOME", "DIA"]).size().reset_index(name="FOI_CONVOCADO")
+    df_nao = df_nao.merge(convocados_dias, on=["NOME", "DIA"], how="left")
+    df_nao["FOI_CONVOCADO"].fillna(0, inplace=True)
+
+    def em_ferias_ou_indisp(row):
+        dia_num = dias_map.get(row["DIA"], None)
+        if pd.notna(row["DIAS_INDISPONIBILIDADE"]) and str(row["DIAS_INDISPONIBILIDADE"]).strip():
+            dias = [d.strip().upper().replace("Ç", "C").replace("Á", "A") for d in str(row["DIAS_INDISPONIBILIDADE"]).split(",")]
+            dias_num_list = [dias_map[d] for d in dias if d in dias_map]
+            if dia_num in dias_num_list:
+                return True
+        if pd.notna(row["INICIO_INDISPONIBILIDADE"]) and pd.notna(row["FIM_INDISPONIBILIDADE"]):
+            try:
+                data_exemplo = datetime.strptime("2025-01-01", "%Y-%m-%d")
+                if row["INICIO_INDISPONIBILIDADE"].date() <= data_exemplo.date() <= row["FIM_INDISPONIBILIDADE"].date():
+                    return True
+            except:
+                pass
+        return False
+
+    df_nao_final = df_nao[(df_nao["FOI_CONVOCADO"] == 0) & (~df_nao.apply(em_ferias_ou_indisp, axis=1))]
+    df_nao_final = (
+        df_nao_final.groupby(["NOME", "CATEGORIA", "PRESIDENTE_DE_BANCA"])["DIA"]
+        .apply(lambda x: ", ".join(sorted(x)))
+        .reset_index()
+        .rename(columns={"PRESIDENTE_DE_BANCA": "PRESIDENTE", "DIA": "DIAS_NAO_CONVOCADOS"})
+    )
+    df_nao_final = df_nao_final[["NOME", "CATEGORIA", "PRESIDENTE", "DIAS_NAO_CONVOCADOS"]]
 
     # --- Criando planilha Excel ---
     wb = Workbook()
@@ -269,10 +285,9 @@ def processar_distribuicao(arquivo):
     for r in dataframe_to_rows(df_conv, index=False, header=True):
         ws1.append(r)
     ws2 = wb.create_sheet("Nao Convocados")
-    for r in dataframe_to_rows(df_nao, index=False, header=True):
+    for r in dataframe_to_rows(df_nao_final, index=False, header=True):
         ws2.append(r)
 
-    # Ajuste automático de largura das colunas
     for ws in [ws1, ws2]:
         for col in ws.columns:
             max_length = 0
@@ -288,7 +303,7 @@ def processar_distribuicao(arquivo):
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return "Distribuicao_Completa.xlsx", df_conv, df_nao, buf, mensagens_vanessa
+    return "Distribuicao_Completa.xlsx", df_conv, df_nao_final, buf, mensagens_vanessa
 
 # ==============================
 # 💻 Interface Streamlit
