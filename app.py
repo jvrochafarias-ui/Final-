@@ -7,13 +7,10 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
 import unicodedata
-import time
-import urllib.parse
-import webbrowser
 
-# -----------------------
-# Configuração de locale
-# -----------------------
+# ==============================
+# ⚙️ Configuração de locale
+# ==============================
 try:
     locale.setlocale(locale.LC_TIME, "pt_BR.UTF-8")
 except locale.Error:
@@ -37,15 +34,14 @@ def normalizar_colunas(df):
         "PRESIDENTE DE BANCA": "PRESIDENTE_DE_BANCA",
         "INICIO INDISPONIBILIDADE": "INICIO_INDISPONIBILIDADE",
         "FIM INDISPONIBILIDADE": "FIM_INDISPONIBILIDADE",
-        "DIAS INDISPONIBILIDADE": "DIAS_INDISPONIBILIDADE",
-        "TELEFONE": "TELEFONE"
+        "DIAS INDISPONIBILIDADE": "DIAS_INDISPONIBILIDADE"
     }
     for antiga, nova in renomear.items():
         if antiga in df.columns:
             df.rename(columns={antiga: nova}, inplace=True)
-    for col in ["MUNICIPIO", "MUNICIPIO_ORIGEM", "CATEGORIA", "NOME", "TELEFONE"]:
+    for col in ["MUNICIPIO", "MUNICIPIO_ORIGEM", "CATEGORIA", "NOME"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).apply(lambda s: remover_acentos(s).strip().upper() if isinstance(s, str) else s)
+            df[col] = df[col].astype(str).apply(lambda s: remover_acentos(s).strip().upper())
     return df
 
 # ==============================
@@ -137,12 +133,10 @@ def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_gl
 def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
     df = normalizar_colunas(df)
-    
+   
     if "PRESIDENTE_DE_BANCA" not in df.columns:
         df["PRESIDENTE_DE_BANCA"] = "NAO"
-    if "TELEFONE" not in df.columns:
-        df["TELEFONE"] = ""
-
+   
     for col in ["DATA", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -175,6 +169,7 @@ def processar_distribuicao(arquivo):
         ), axis=1)].reset_index(drop=True)
 
         candidatos = filtrar_candidatos(candidatos, municipio, data, convocados)
+
         candidatos["MATCH_COUNT"] = candidatos["CATEGORIA"].apply(lambda c: matching_count_fallback(c, categoria_oper))
         candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
         if vanessa_ativa:
@@ -213,18 +208,16 @@ def processar_distribuicao(arquivo):
 
         total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
         for i, nome in enumerate(total_selecionados):
-            linha = df.loc[df["NOME"] == nome].iloc[0]
-            cat = linha.get("CATEGORIA", "")
-            telefone = linha.get("TELEFONE", "")
+            cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
             presidente_flag = "SIM" if presidente is not None and nome == presidente["NOME"] else "NAO"
             convocados.append({
                 "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
-                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag, "TELEFONE": telefone
+                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag
             })
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
 
-    # --- Aba de não convocados ---
+    # --- Aba de não convocados (corrigida) ---
     dias_validos = df["DIA"].unique()
     combinacoes = []
     for nome in df["NOME"].unique():
@@ -232,18 +225,20 @@ def processar_distribuicao(arquivo):
             combinacoes.append({"NOME": nome, "DIA": dia})
     base_completa = pd.DataFrame(combinacoes)
     df_base = df[["NOME", "CATEGORIA", "PRESIDENTE_DE_BANCA",
-                  "DIAS_INDISPONIBILIDADE", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE", "TELEFONE"]].drop_duplicates(subset=["NOME"])
+                  "DIAS_INDISPONIBILIDADE", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]].drop_duplicates(subset=["NOME"])
 
-    # Filtra quem está indisponível durante todo o período
+    # --- FILTRAR quem está indisponível durante todo o período da operação ---
     data_inicio_op = df['DATA'].min()
     data_fim_op = df['DATA'].max()
 
     def esta_totalmente_indisp(row):
+        # Dias da semana indisponíveis
         dias = row.get("DIAS_INDISPONIBILIDADE","")
         if pd.notna(dias) and str(dias).strip() != "":
             dias_list = [d.strip().upper() for d in str(dias).split(",")]
             if set(dias_list) == set(dias_map.keys()):
                 return True
+        # Intervalo de datas de indisponibilidade
         inicio = row.get("INICIO_INDISPONIBILIDADE")
         fim = row.get("FIM_INDISPONIBILIDADE")
         if pd.notna(inicio) and pd.notna(fim):
@@ -252,6 +247,7 @@ def processar_distribuicao(arquivo):
         return False
 
     df_base = df_base[~df_base.apply(esta_totalmente_indisp, axis=1)]
+
     df_nao = base_completa.merge(df_base, on="NOME", how="left")
     convocados_dias = df_conv.groupby(["NOME", "DIA"]).size().reset_index(name="FOI_CONVOCADO")
     df_nao = df_nao.merge(convocados_dias, on=["NOME", "DIA"], how="left")
@@ -313,6 +309,7 @@ def processar_distribuicao(arquivo):
 # 💻 Interface Streamlit
 # ==============================
 st.set_page_config(page_title="Distribuição 100% Completa", page_icon="⚖️", layout="centered")
+
 st.markdown("""
 <style>
 .stApp {background: linear-gradient(135deg,#003c63,#015e78,#027b91);background-attachment:fixed;color:white;font-family:'Segoe UI',sans-serif;}
@@ -320,65 +317,37 @@ st.markdown("""
 .main-card h1 {font-size:2.2rem;font-weight:700;color:#fff;}
 .main-card p {font-size:1.1rem;color:#dcdcdc;}
 .stButton button {background:linear-gradient(90deg,#00c6ff,#0072ff);color:white;border:none;border-radius:12px;padding:12px 25px;font-size:1rem;font-weight:bold;transition:0.3s;}
-.stButton button:hover {transform:scale(1.05);}
+.stButton button:hover {transform:scale(1.05);background:linear-gradient(90deg,#0072ff,#00c6ff);}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-card"><h1>Distribuição de Pessoas</h1><p>Carregue seu Excel e gere a distribuição automática</p></div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="main-card">
+<h1>⚖️ Distribuição Equilibrada e Completa</h1>
+<p>O sistema garante sempre 100% das vagas preenchidas com pelo menos um presidente real, evitando convocações duplicadas no mesmo dia e nenhum convocado no seu município de origem. Categoria “E” é priorizada quando exigida.</p>
+</div>
+""", unsafe_allow_html=True)
 
-arquivo = st.file_uploader("📁 Escolha o arquivo Excel", type=["xlsx", "xls"])
+arquivo = st.file_uploader("📁 Envie a planilha (.xlsx)", type="xlsx")
 
-if arquivo is not None:
-    st.success("✅ Arquivo carregado!")
-    if st.button("⚖️ Processar Distribuição"):
-        nome_arquivo, df_conv, df_nao_final, buf_excel, msg_vanessa = processar_distribuicao(arquivo)
-        st.success(f"✅ Distribuição concluída! Total de convocados: {len(df_conv)}")
-        st.download_button("📥 Baixar Excel Completo", buf_excel, file_name=nome_arquivo, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if arquivo:
+    if st.button("🔄 Gerar Distribuição Completa"):
+        with st.spinner("Processando..."):
+            nome_saida, df_conv, df_nao, buf, msgs_vanessa = processar_distribuicao(arquivo)
+            st.success("✅ Distribuição completa gerada com sucesso!")
 
-        if msg_vanessa:
-            st.info("📌 Observações:")
-            for m in msg_vanessa:
-                st.write(m)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### 👥 Convocados")
+                st.dataframe(df_conv, use_container_width=True)
+            with col2:
+                st.markdown("### 🚫 Não Convocados")
+                st.dataframe(df_nao, use_container_width=True)
 
-        # Mostrar dataframe
-        st.subheader("Convocados")
-        st.dataframe(df_conv)
-        st.subheader("Não Convocados")
-        st.dataframe(df_nao_final)
-
-        # -----------------------------
-        # WhatsApp Web (sem Selenium)
-        # -----------------------------
-        st.subheader("📲 Abrir links WhatsApp")
-        delay_sec = st.number_input("⏱ Delay entre links (segundos)", min_value=1, max_value=10, value=3)
-
-        def send_whatsapp_messages(df, delay_between=3):
-            total_links = 0
-            for idx, row in df.iterrows():
-                nome = row.get("NOME", "")
-                telefone = str(row.get("TELEFONE", ""))
-                municipio = row.get("MUNICIPIO", "")
-                data = row.get("DATA", "")
-
-                if not telefone or telefone.lower() == "nan":
-                    st.warning(f"⚠️ {nome} não tem telefone cadastrado.")
-                    continue
-
-                tel_digits = "".join([c for c in telefone if c.isdigit()])
-                if not tel_digits.startswith("55"):
-                    tel_digits = "55" + tel_digits
-
-                mensagem = f"Olá {nome}, você foi convocado(a) para {municipio} em {data}"
-                mensagem_encoded = urllib.parse.quote(mensagem)
-                link = f"https://wa.me/{tel_digits}?text={mensagem_encoded}"
-
-                webbrowser.open(link)
-                total_links += 1
-                time.sleep(delay_between)
-
-            return total_links
-
-        if st.button("📤 Abrir links no WhatsApp Web"):
-            with st.spinner("⌛ Abrindo links no navegador..."):
-                total_links = send_whatsapp_messages(df_conv, delay_between=delay_sec)
-                st.success(f"✅ Links abertos no navegador: {total_links}")
+            b64 = base64.b64encode(buf.read()).decode()
+            st.markdown(f"""
+            <div style="text-align:center;margin-top:30px;">
+            <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{nome_saida}" target="_blank" style="background:linear-gradient(90deg,#00c6ff,#0072ff);padding:12px 25px;color:white;text-decoration:none;border-radius:12px;font-size:16px;font-weight:bold;">
+            ⬇️ Baixar Excel
+            </a></div>
+            """, unsafe_allow_html=True)
