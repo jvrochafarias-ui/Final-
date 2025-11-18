@@ -7,6 +7,23 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
 import unicodedata
+import time
+
+# -----------------------
+# Selenium (WhatsApp) try import
+# -----------------------
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
+
+# If you need to specify chromedriver path, set here (or leave None if chromedriver is in PATH)
+CHROMEDRIVER_PATH = None  # ex: r"C:\tools\chromedriver.exe" or None
 
 # ==============================
 # ⚙️ Configuração de locale
@@ -34,14 +51,15 @@ def normalizar_colunas(df):
         "PRESIDENTE DE BANCA": "PRESIDENTE_DE_BANCA",
         "INICIO INDISPONIBILIDADE": "INICIO_INDISPONIBILIDADE",
         "FIM INDISPONIBILIDADE": "FIM_INDISPONIBILIDADE",
-        "DIAS INDISPONIBILIDADE": "DIAS_INDISPONIBILIDADE"
+        "DIAS INDISPONIBILIDADE": "DIAS_INDISPONIBILIDADE",
+        "TELEFONE": "TELEFONE"
     }
     for antiga, nova in renomear.items():
         if antiga in df.columns:
             df.rename(columns={antiga: nova}, inplace=True)
-    for col in ["MUNICIPIO", "MUNICIPIO_ORIGEM", "CATEGORIA", "NOME"]:
+    for col in ["MUNICIPIO", "MUNICIPIO_ORIGEM", "CATEGORIA", "NOME", "TELEFONE"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).apply(lambda s: remover_acentos(s).strip().upper())
+            df[col] = df[col].astype(str).apply(lambda s: remover_acentos(s).strip().upper() if isinstance(s, str) else s)
     return df
 
 # ==============================
@@ -128,7 +146,7 @@ def aplicar_regra_frequencia(df_candidatos, data, categoria_oper, conv_semana_gl
     return df_candidatos
 
 # ==============================
-# 🧠 Processamento principal
+# 🧠 Processamento principal (mantive suas regras)
 # ==============================
 def processar_distribuicao(arquivo):
     df = pd.read_excel(arquivo)
@@ -136,7 +154,9 @@ def processar_distribuicao(arquivo):
     
     if "PRESIDENTE_DE_BANCA" not in df.columns:
         df["PRESIDENTE_DE_BANCA"] = "NAO"
-    
+    if "TELEFONE" not in df.columns:
+        df["TELEFONE"] = ""
+
     for col in ["DATA", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -208,11 +228,13 @@ def processar_distribuicao(arquivo):
 
         total_selecionados = ([presidente["NOME"]] if presidente is not None else []) + selecionados
         for i, nome in enumerate(total_selecionados):
-            cat = df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0]
+            linha = df.loc[df["NOME"] == nome].iloc[0]
+            cat = linha.get("CATEGORIA", "")
+            telefone = linha.get("TELEFONE", "")
             presidente_flag = "SIM" if presidente is not None and nome == presidente["NOME"] else "NAO"
             convocados.append({
                 "DIA": dia, "DATA": data.date(), "MUNICIPIO": municipio,
-                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag
+                "NOME": nome, "CATEGORIA": cat, "PRESIDENTE": presidente_flag, "TELEFONE": telefone
             })
 
     df_conv = pd.DataFrame(convocados).drop_duplicates()
@@ -225,20 +247,18 @@ def processar_distribuicao(arquivo):
             combinacoes.append({"NOME": nome, "DIA": dia})
     base_completa = pd.DataFrame(combinacoes)
     df_base = df[["NOME", "CATEGORIA", "PRESIDENTE_DE_BANCA",
-                  "DIAS_INDISPONIBILIDADE", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE"]].drop_duplicates(subset=["NOME"])
+                  "DIAS_INDISPONIBILIDADE", "INICIO_INDISPONIBILIDADE", "FIM_INDISPONIBILIDADE", "TELEFONE"]].drop_duplicates(subset=["NOME"])
 
     # --- FILTRAR quem está indisponível durante todo o período da operação ---
     data_inicio_op = df['DATA'].min()
     data_fim_op = df['DATA'].max()
 
     def esta_totalmente_indisp(row):
-        # Dias da semana indisponíveis
         dias = row.get("DIAS_INDISPONIBILIDADE","")
         if pd.notna(dias) and str(dias).strip() != "":
             dias_list = [d.strip().upper() for d in str(dias).split(",")]
             if set(dias_list) == set(dias_map.keys()):
                 return True
-        # Intervalo de datas de indisponibilidade
         inicio = row.get("INICIO_INDISPONIBILIDADE")
         fim = row.get("FIM_INDISPONIBILIDADE")
         if pd.notna(inicio) and pd.notna(fim):
@@ -306,7 +326,7 @@ def processar_distribuicao(arquivo):
     return "Distribuicao_Completa.xlsx", df_conv, df_nao_final, buf, mensagens_vanessa
 
 # ==============================
-# 💻 Interface Streamlit
+# 💻 Interface Streamlit (UI)
 # ==============================
 st.set_page_config(page_title="Distribuição 100% Completa", page_icon="⚖️", layout="centered")
 
@@ -328,7 +348,91 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-arquivo = st.file_uploader("📁 Envie a planilha (.xlsx)", type="xlsx")
+arquivo = st.file_uploader("📁 Envie a planilha (.xlsx) — precisa ter coluna TELEFONE", type="xlsx")
+
+# -----------------------------
+# Função auxiliar: formata telefone internacional para WhatsApp (apenas dígitos)
+# Exemplo: transforma "(11) 9 9123-4567" -> "5511991234567" (você pode ajustar para seu país)
+# -----------------------------
+def formatar_telefone_para_whatsapp(tel_raw):
+    if not isinstance(tel_raw, str):
+        tel_raw = str(tel_raw)
+    digits = "".join(ch for ch in tel_raw if ch.isdigit())
+    # Se o número já tem código do país (ex: 55...), devolve direto
+    if digits.startswith("55") and len(digits) >= 12:
+        return digits
+    # Caso comum BR: se começa com 0 ou 9? Aqui tentamos adicionar '55' (Brasil) se faltar.
+    # Ajuste conforme seu país/regra
+    if len(digits) >= 10:
+        return "55" + digits
+    return digits
+
+# -----------------------------
+# Função que envia mensagens via WhatsApp Web usando Selenium
+# -----------------------------
+def send_whatsapp_messages(resumo_df, headless=False, delay_between=3):
+    """
+    resumo_df deve ter colunas: NOME, TELEFONE, ITENS (mensagem já formatada).
+    Requisitos: Selenium + Chrome + chromedriver. Roda localmente.
+    """
+    if not SELENIUM_AVAILABLE:
+        raise RuntimeError("Selenium não está disponível. Instale selenium e chromedriver.")
+
+    # Configura driver
+    options = webdriver.ChromeOptions()
+    # mantemos perfil do usuário para já estar logado no WhatsApp Web (evita QR)
+    # OBS: caminho do perfil precisa ser ajustado se usar
+    # options.add_argument(r"user-data-dir=C:\Users\<seu_usuario>\AppData\Local\Google\Chrome\User Data")
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1200,800")
+    # Inicia o driver
+    if CHROMEDRIVER_PATH:
+        driver = webdriver.Chrome(executable_path=CHROMEDRIVER_PATH, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
+
+    wait = WebDriverWait(driver, 60)
+    sent = 0
+    try:
+        for _, row in resumo_df.iterrows():
+            nome = row.get("NOME", "")
+            telefone = row.get("TELEFONE", "")
+            itens = row.get("ITENS", "")
+            if not telefone or str(telefone).strip() == "":
+                continue
+            phone = formatar_telefone_para_whatsapp(telefone)
+            if not phone or len(phone) < 10:
+                continue
+            # Monta mensagem
+            mensagem = f"Bom Dia, Prezado {nome}\\n\\nSegue abaixo os dias e os municípios que você foi convocado para fazer a operação:\\n\\n{itens}\\n\\nAtenciosamente,"
+            url = f"https://web.whatsapp.com/send?phone={phone}&text={mensagem}"
+            driver.get(url)
+            # espera carregar o botão de enviar ou textarea
+            try:
+                # Aguarda até que o botão de enviar (xpath por exemplo) esteja presente
+                # alternativa: esperar textarea e dar ENTER
+                txt_xpath = "//div[@contenteditable='true' and @data-tab='10']"
+                wait.until(EC.presence_of_element_located((By.XPATH, txt_xpath)))
+                time.sleep(1)  # pequena espera para estabilidade
+                # Foca no campo e envia ENTER
+                input_box = driver.find_element(By.XPATH, txt_xpath)
+                input_box.click()
+                # já vem com o texto do parâmetro, apenas pressionar ENTER
+                input_box.send_keys(Keys.ENTER)
+                sent += 1
+                time.sleep(delay_between)  # espera entre envios
+            except Exception as e:
+                # caso não consiga enviar automaticamente, deixa a aba aberta para envio manual
+                st.warning(f"Não foi possível enviar automaticamente para {nome} ({telefone}). Aba aberta para você enviar manualmente.")
+                # mantém a aba aberta alguns segundos para você ver; ou continue
+                time.sleep(2)
+                continue
+    finally:
+        # não fechamos o driver imediatamente; fechar é responsabilidade do fluxo
+        driver.quit()
+    return sent
 
 if arquivo:
     if st.button("🔄 Gerar Distribuição Completa"):
@@ -346,8 +450,46 @@ if arquivo:
 
             b64 = base64.b64encode(buf.read()).decode()
             st.markdown(f"""
-            <div style="text-align:center;margin-top:30px;">
+            <div style="text-align:center;margin-top:20px;">
             <a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{nome_saida}" target="_blank" style="background:linear-gradient(90deg,#00c6ff,#0072ff);padding:12px 25px;color:white;text-decoration:none;border-radius:12px;font-size:16px;font-weight:bold;">
             ⬇️ Baixar Excel
             </a></div>
             """, unsafe_allow_html=True)
+
+            # --- Preparar mensagens por convocado (para WhatsApp) ---
+            resumo = df_conv.groupby("NOME").apply(
+                lambda g: pd.Series({
+                    "TELEFONE": g["TELEFONE"].iloc[0] if "TELEFONE" in g.columns else "",
+                    "ITENS": "\n".join([f"{r['DATA'].strftime('%d/%m/%Y')} - {r['MUNICIPIO']}" for _, r in g.sort_values(by="DATA").iterrows()])
+                })
+            ).reset_index()
+
+            st.markdown("### ✳️ Enviar convocação pelo WhatsApp Web (automático)")
+            st.write("Requisitos: WhatsApp Web autenticado no navegador, Chrome + chromedriver instalados, app rodando no seu PC.")
+            if not SELENIUM_AVAILABLE:
+                st.error("Selenium não está instalado neste ambiente. Instale `selenium` e o ChromeDriver no seu PC para ativar o envio automático.")
+            else:
+                # Mostrar resumo simples
+                st.dataframe(resumo, use_container_width=True)
+
+                col_a, col_b = st.columns([1,2])
+                with col_a:
+                    headless = st.checkbox("Rodar headless (não mostra janela)", value=False)
+                with col_b:
+                    delay_between = st.number_input("Segundos entre cada envio", min_value=1, max_value=20, value=3)
+
+                enviar_whatsapp = st.button("📱 Enviar via WhatsApp Web (automático)")
+                if enviar_whatsapp:
+                    st.info("Iniciando envio via WhatsApp Web... atenção ao navegador que vai abrir. Se aparecer QR, escaneie-o no seu celular.")
+                    try:
+                        sent_count = send_whatsapp_messages(resumo, headless=headless, delay_between=delay_between)
+                        st.success(f"Mensagens enviadas: {sent_count}")
+                    except Exception as e:
+                        st.error(f"Erro no envio via Selenium: {e}")
+                        st.info("Verifique se o ChromeDriver está instalado e compatível com sua versão do Chrome, e se o Selenium está instalado (pip install selenium).")
+
+            # Mostrar mensagens da regra Vanessa, se houver
+            if msgs_vanessa:
+                st.markdown("### Mensagens especiais")
+                for m in msgs_vanessa:
+                    st.info(m)
