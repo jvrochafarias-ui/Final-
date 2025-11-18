@@ -8,14 +8,8 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
 import unicodedata
 import time
-
-# Selenium imports e ChromeDriver automático
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+import urllib.parse
+import webbrowser
 
 # -----------------------
 # Configuração de locale
@@ -334,57 +328,57 @@ st.markdown('<div class="main-card"><h1>Distribuição de Pessoas</h1><p>Carregu
 
 arquivo = st.file_uploader("📁 Escolha o arquivo Excel", type=["xlsx", "xls"])
 
-if arquivo:
-    nome_arquivo, df_conv, df_nao, buf_excel, msgs_vanessa = processar_distribuicao(arquivo)
-    st.success("✅ Distribuição gerada com sucesso!")
-    st.markdown(f"📥 [Baixar Excel completo]({st.download_button(label='Download', data=buf_excel, file_name=nome_arquivo, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')})", unsafe_allow_html=True)
-    if msgs_vanessa:
-        for msg in msgs_vanessa:
-            st.info(msg)
+if arquivo is not None:
+    st.success("✅ Arquivo carregado!")
+    if st.button("⚖️ Processar Distribuição"):
+        nome_arquivo, df_conv, df_nao_final, buf_excel, msg_vanessa = processar_distribuicao(arquivo)
+        st.success(f"✅ Distribuição concluída! Total de convocados: {len(df_conv)}")
+        st.download_button("📥 Baixar Excel Completo", buf_excel, file_name=nome_arquivo, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ==============================
-# 📲 Botão para enviar WhatsApp
-# ==============================
-def send_whatsapp_messages(df, headless=False, delay_between=3):
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--user-data-dir=./user_data")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    driver.get("https://web.whatsapp.com")
-    st.info("⌛ Escaneie o QR Code se necessário e aguarde carregar a tela do WhatsApp Web...")
-    time.sleep(15)  # Tempo para logar e carregar chats
+        if msg_vanessa:
+            st.info("📌 Observações:")
+            for m in msg_vanessa:
+                st.write(m)
 
-    total_enviadas = 0
-    for idx, row in df.iterrows():
-        try:
-            telefone = row.get("TELEFONE", "")
-            mensagem = f"Olá {row.get('NOME','')}, você foi convocado(a) para {row.get('MUNICIPIO','')} em {row.get('DATA','')}"
-            if telefone and telefone.isdigit():
-                url = f"https://web.whatsapp.com/send?phone={telefone}&text={mensagem}"
-                driver.get(url)
+        # Mostrar dataframe
+        st.subheader("Convocados")
+        st.dataframe(df_conv)
+        st.subheader("Não Convocados")
+        st.dataframe(df_nao_final)
+
+        # -----------------------------
+        # WhatsApp Web (sem Selenium)
+        # -----------------------------
+        st.subheader("📲 Abrir links WhatsApp")
+        delay_sec = st.number_input("⏱ Delay entre links (segundos)", min_value=1, max_value=10, value=3)
+
+        def send_whatsapp_messages(df, delay_between=3):
+            total_links = 0
+            for idx, row in df.iterrows():
+                nome = row.get("NOME", "")
+                telefone = str(row.get("TELEFONE", ""))
+                municipio = row.get("MUNICIPIO", "")
+                data = row.get("DATA", "")
+
+                if not telefone or telefone.lower() == "nan":
+                    st.warning(f"⚠️ {nome} não tem telefone cadastrado.")
+                    continue
+
+                tel_digits = "".join([c for c in telefone if c.isdigit()])
+                if not tel_digits.startswith("55"):
+                    tel_digits = "55" + tel_digits
+
+                mensagem = f"Olá {nome}, você foi convocado(a) para {municipio} em {data}"
+                mensagem_encoded = urllib.parse.quote(mensagem)
+                link = f"https://wa.me/{tel_digits}?text={mensagem_encoded}"
+
+                webbrowser.open(link)
+                total_links += 1
                 time.sleep(delay_between)
-                try:
-                    btn = driver.find_element(By.XPATH, "//button[@data-testid='compose-btn-send']")
-                    btn.click()
-                    total_enviadas += 1
-                except:
-                    pass
-            time.sleep(delay_between)
-        except Exception as e:
-            print(f"Erro ao enviar para {row.get('NOME')}: {e}")
-    driver.quit()
-    return total_enviadas
 
-if arquivo and not df_conv.empty:
-    st.subheader("📩 Enviar mensagens via WhatsApp")
-    headless_mode = st.checkbox("Rodar em segundo plano (Headless)", value=False)
-    delay_sec = st.number_input("Intervalo entre mensagens (segundos)", min_value=1, max_value=10, value=3, step=1)
+            return total_links
 
-    if st.button("📤 Enviar mensagens"):
-        with st.spinner("⌛ Enviando mensagens... abra o WhatsApp Web se não estiver logado"):
-            try:
-                sent_total = send_whatsapp_messages(df_conv, headless=headless_mode, delay_between=delay_sec)
-                st.success(f"✅ Mensagens enviadas com sucesso! Total: {sent_total}")
-            except Exception as e:
-                st.error(f"❌ Ocorreu um erro: {e}")
+        if st.button("📤 Abrir links no WhatsApp Web"):
+            with st.spinner("⌛ Abrindo links no navegador..."):
+                total_links = send_whatsapp_messages(df_conv, delay_between=delay_sec)
+                st.success(f"✅ Links abertos no navegador: {total_links}")
