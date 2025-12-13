@@ -175,18 +175,17 @@ def processar_distribuicao(arquivo):
     if "DIA" not in df.columns and "DATA" in df.columns:
         df["DIA"] = df["DATA"].dt.day_name().str.upper()
 
-    df["DATA"].fillna(method="ffill", inplace=True)
-    df["DIA"].fillna(method="ffill", inplace=True)
+    df["DATA"].ffill(inplace=True)
+    df["DIA"].ffill(inplace=True)
 
     if "QUANTIDADE" not in df.columns:
         df["QUANTIDADE"] = 1
 
     df["QUANTIDADE"] = df["QUANTIDADE"].fillna(0).astype(int)
 
-    cont_pres = {}
-    conv_semana_global = {}
     convocados = []
     mensagens_vanessa = []
+    conv_semana_global = {}
 
     operacoes = df.groupby(
         ["DIA", "DATA", "MUNICIPIO", "CATEGORIA", "QUANTIDADE"],
@@ -200,6 +199,7 @@ def processar_distribuicao(arquivo):
 
         data = pd.to_datetime(data)
 
+        # Remove indisponíveis
         candidatos = df.loc[
             ~df.apply(
                 lambda r: esta_indisponivel(
@@ -211,7 +211,7 @@ def processar_distribuicao(arquivo):
                 ),
                 axis=1
             )
-        ].reset_index(drop=True)
+        ].copy()
 
         candidatos = filtrar_candidatos(candidatos, municipio, data, convocados)
         candidatos, vanessa_ativa = aplicar_regra_vanessa(candidatos, categoria_oper, data)
@@ -225,26 +225,44 @@ def processar_distribuicao(arquivo):
             candidatos, data, categoria_oper, conv_semana_global
         )
 
-        pool = candidatos.copy()
+        # ==============================
+        # 👑 SEPARA PRESIDENTES
+        # ==============================
+        pool_presidente = candidatos[candidatos["PRESIDENTE_DE_BANCA"] == "SIM"]
+        pool_normal = candidatos[candidatos["PRESIDENTE_DE_BANCA"] != "SIM"]
 
-        nomes_ja = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
         selecionados = []
+        nomes_ja = [c["NOME"] for c in convocados if c["DATA"] == data.date()]
 
-        for _, r in pool.iterrows():
+        # 👉 Seleciona 1 presidente primeiro
+        presidente_nome = None
+        if not pool_presidente.empty:
+            for _, r in pool_presidente.iterrows():
+                if r["NOME"] not in nomes_ja:
+                    presidente_nome = r["NOME"]
+                    selecionados.append((r["NOME"], "SIM"))
+                    nomes_ja.append(r["NOME"])
+                    break
+
+        # 👉 Completa com demais convocados
+        for _, r in pool_normal.iterrows():
             if len(selecionados) >= qtd:
                 break
             if r["NOME"] not in nomes_ja:
-                selecionados.append(r["NOME"])
+                selecionados.append((r["NOME"], "NAO"))
                 nomes_ja.append(r["NOME"])
 
-        for nome in selecionados:
+        # 👉 Garante não passar da quantidade
+        selecionados = selecionados[:qtd]
+
+        for nome, eh_presidente in selecionados:
             convocados.append({
                 "DIA": dia,
                 "DATA": data.date(),
                 "MUNICIPIO": municipio,
                 "NOME": nome,
                 "CATEGORIA": df.loc[df["NOME"] == nome, "CATEGORIA"].iloc[0],
-                "PRESIDENTE": "NAO"
+                "PRESIDENTE": eh_presidente
             })
 
     df_conv = pd.DataFrame(convocados)
@@ -302,4 +320,5 @@ if arquivo:
             ⬇️ Baixar Excel
             </a></div>
             """, unsafe_allow_html=True)
+
 
